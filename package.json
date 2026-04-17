@@ -1,17 +1,17 @@
 {
-  "name": "debugmcpextension",
-  "displayName": "DebugMCP",
-  "description": "Let AI agents debug your code inside VS Code — breakpoints, step-through execution, variable inspection, and expression evaluation. Automatically exposes itself as an MCP (Model Context Protocol) server for seamless integration with AI assistants.",
+  "name": "cmsis-debugmcp",
+  "displayName": "CMSIS-DebugMCP",
+  "description": "AI-driven debugging for Arm Cortex-M targets via the CMSIS Debugger. MCP server with fault analysis, memory inspection, peripheral registers, and core register reads. Fork of microsoft/DebugMCP.",
   "version": "1.0.9",
-  "publisher": "ozzafar",
+  "publisher": "mather01",
   "author": {
-    "name": "Oz Zafar",
-    "email": "ozzafar@gmail.com"
+    "name": "Matthias Hertel",
+    "email": "matthias.hertel@arm.com"
   },
   "license": "MIT",
-  "homepage": "https://github.com/microsoft/DebugMCP",
+  "homepage": "https://github.com/mather01/DebugMCP",
   "bugs": {
-    "url": "https://github.com/microsoft/DebugMCP/issues"
+    "url": "https://github.com/mather01/DebugMCP/issues"
   },
   "keywords": [
     "debug",
@@ -27,7 +27,12 @@
     "breakpoints",
     "debugger",
     "ai agent",
-    "copilot"
+    "copilot",
+    "embedded",
+    "cortex-m",
+    "cmsis",
+    "arm",
+    "gdbtarget"
   ],
   "engines": {
     "vscode": "^1.104.0"
@@ -39,9 +44,10 @@
     "Programming Languages"
   ],
   "extensionDependencies": [],
+  "extensionPack": [],
   "repository": {
     "type": "git",
-    "url": "https://github.com/microsoft/DebugMCP.git"
+    "url": "https://github.com/mather01/DebugMCP.git"
   },
   "activationEvents": [
     "onStartupFinished",
@@ -51,31 +57,31 @@
   "contributes": {
     "commands": [
       {
-        "command": "debugmcp.showAgentSelectionPopup",
+        "command": "cmsis-debugmcp.showAgentSelectionPopup",
         "title": "Show Agent Selection Popup",
-        "category": "DebugMCP"
+        "category": "CMSIS-DebugMCP"
       }
     ],
     "menus": {
       "commandPalette": [
         {
-          "command": "debugmcp.showAgentSelectionPopup",
+          "command": "cmsis-debugmcp.showAgentSelectionPopup",
           "when": "true"
         }
       ]
     },
     "configuration": {
-      "title": "DebugMCP",
+      "title": "CMSIS-DebugMCP",
       "properties": {
-        "debugmcp.timeoutInSeconds": {
+        "cmsis-debugmcp.timeoutInSeconds": {
           "type": "number",
           "default": 180,
-          "description": "Timeout in seconds"
+          "description": "Timeout in seconds for debugging operations"
         },
-        "debugmcp.serverPort": {
+        "cmsis-debugmcp.serverPort": {
           "type": "number",
           "default": 3001,
-          "description": "Port number for the DebugMCP server"
+          "description": "Port number for the CMSIS-DebugMCP server"
         }
       }
     }

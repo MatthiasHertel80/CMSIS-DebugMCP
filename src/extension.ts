@@ -10,12 +10,12 @@ let agentConfigManager: AgentConfigurationManager | null = null;
 
 export async function activate(context: vscode.ExtensionContext) {
     // Initialize logging first
-    logger.info('DebugMCP extension is now active!');
+    logger.info('CMSIS-DebugMCP extension is now active!');
     logger.logSystemInfo();
     logger.logEnvironment();
 
-    const config = vscode.workspace.getConfiguration('debugmcp');
-    const timeoutInSeconds = config.get<number>('timeoutInSeconds', 180);
+    const config = vscode.workspace.getConfiguration('cmsis-debugmcp');
+    const timeoutInSeconds = config.get<number>('timeoutInSeconds', 60);
     const serverPort = config.get<number>('serverPort', 3001);
 
     logger.info(`Using timeoutInSeconds: ${timeoutInSeconds} seconds`);
@@ -40,8 +40,8 @@ export async function activate(context: vscode.ExtensionContext) {
         await mcpServer.start();
         
         const endpoint = mcpServer.getEndpoint();
-        logger.info(`DebugMCP server running at: ${endpoint}`);
-        vscode.window.showInformationMessage(`DebugMCP server running on ${endpoint}`);
+        logger.info(`CMSIS-DebugMCP server running at: ${endpoint}`);
+        vscode.window.showInformationMessage(`CMSIS-DebugMCP server running on ${endpoint}`);
     } catch (error) {
         logger.error('Failed to initialize MCP server', error);
         vscode.window.showErrorMessage(`Failed to initialize MCP server: ${error}`);
@@ -61,16 +61,16 @@ export async function activate(context: vscode.ExtensionContext) {
         }
     }, 2000);
 
-    logger.info('DebugMCP extension activated successfully');
+    logger.info('CMSIS-DebugMCP extension activated successfully');
 }
 
 /**
  * Register extension commands
  */
 function registerCommands(context: vscode.ExtensionContext) {
-    // Command to manually configure DebugMCP for agents
+    // Command to manually configure CMSIS-DebugMCP for agents
     const configureAgentsCommand = vscode.commands.registerCommand(
-        'debugmcp.configureAgents',
+        'cmsis-debugmcp.configureAgents',
         async () => {
             if (agentConfigManager) {
                 await agentConfigManager.showManualConfiguration();
@@ -80,7 +80,7 @@ function registerCommands(context: vscode.ExtensionContext) {
 
     // Command to show agent selection popup again
     const showPopupCommand = vscode.commands.registerCommand(
-        'debugmcp.showAgentSelectionPopup',
+        'cmsis-debugmcp.showAgentSelectionPopup',
         async () => {
             if (agentConfigManager) {
                 await agentConfigManager.showAgentSelectionPopup();
@@ -90,11 +90,11 @@ function registerCommands(context: vscode.ExtensionContext) {
 
     // Command to reset popup state (for development/testing)
     const resetPopupCommand = vscode.commands.registerCommand(
-        'debugmcp.resetPopupState',
+        'cmsis-debugmcp.resetPopupState',
         async () => {
             if (agentConfigManager) {
                 await agentConfigManager.resetPopupState();
-                vscode.window.showInformationMessage('DebugMCP popup state has been reset.');
+                vscode.window.showInformationMessage('CMSIS-DebugMCP popup state has been reset.');
             }
         }
     );
@@ -107,8 +107,8 @@ function registerCommands(context: vscode.ExtensionContext) {
 }
 
 export async function deactivate() {
-    logger.info('DebugMCP extension deactivating...');
-    
+    logger.info('CMSIS-DebugMCP extension deactivating...');
+
     // Clean up MCP server
     if (mcpServer) {
         mcpServer.stop().catch(error => {
@@ -116,6 +116,6 @@ export async function deactivate() {
         });
         mcpServer = null;
     }
-    
-    logger.info('DebugMCP extension deactivated');
+
+    logger.info('CMSIS-DebugMCP extension deactivated');
 }

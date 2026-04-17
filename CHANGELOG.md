@@ -1,8 +1,20 @@
 # Changelog
 
-All notable changes to DebugMCP will be documented in this file.
+All notable changes to CMSIS-DebugMCP will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
+
+## [1.0.9] - 2026-04-16
+
+### Added — CMSIS-DebugMCP fork
+- **Project rename**: `DebugMCP` → `CMSIS-DebugMCP`. Extension name, display name, MCP server name, resource URIs (`cmsis-debugmcp://docs/...`), configuration keys (`cmsis-debugmcp.*`), and command IDs updated.
+- **`gdbtarget` passthrough**: when `start_debugging` is called with `configurationName`, the named entry from `launch.json` is passed directly to `vscode.debug.startDebugging()` without language detection or config rewriting. `fileFullPath` is now optional in this path.
+- **Five new embedded MCP tools**: `read_memory`, `read_core_registers`, `read_peripheral_register`, `get_fault_info`, `get_device_info`.
+- **Cortex-M fault decoder**: decodes CFSR (MMFSR/BFSR/UFSR), HFSR, DFSR, MMFAR, BFAR, AFSR into human-readable diagnostics.
+- **Peripheral register reader**: uses the Peripheral Inspector extension API when available; falls back to SVD parsing + DAP `readMemory`.
+- **CMSIS knowledge resources**: `cmsis-debugmcp://docs/cmsis-embedded-guide` and `cmsis-debugmcp://docs/troubleshooting/embedded` provide Cortex-M expertise to agents.
+
+### Upstream history (DebugMCP)
 
 ## [1.0.8] - 2025-03-14
 

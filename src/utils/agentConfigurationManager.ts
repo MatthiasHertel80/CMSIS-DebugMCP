@@ -23,7 +23,7 @@ export interface MCPServerConfig {
 
 export class AgentConfigurationManager {
     private context: vscode.ExtensionContext;
-    private readonly POPUP_SHOWN_KEY = 'debugmcp.popupShown';
+    private readonly POPUP_SHOWN_KEY = 'cmsis-debugmcp.popupShown';
     private readonly timeoutInSeconds: number;
     private readonly serverPort: number;
     
@@ -74,13 +74,13 @@ export class AgentConfigurationManager {
 
         const items: vscode.QuickPickItem[] = agents.map(agent => ({
             label: agent.displayName,
-            description: 'Configure DebugMCP for this agent',
-            detail: `Add DebugMCP server configuration to ${agent.displayName}`
+            description: 'Configure CMSIS-DebugMCP for this agent',
+            detail: `Add CMSIS-DebugMCP server configuration to ${agent.displayName}`
         }));
 
         const selected = await vscode.window.showQuickPick(items, {
-            title: 'Configure DebugMCP for AI Agent', 
-            placeHolder: 'Select an AI agent to configure with DebugMCP'
+            title: 'Configure CMSIS-DebugMCP for AI Agent',
+            placeHolder: 'Select an AI agent to configure with CMSIS-DebugMCP'
         });
 
         if (selected) {
@@ -149,7 +149,7 @@ export class AgentConfigurationManager {
     }
 
     /**
-     * Get DebugMCP server configuration with current port and timeout settings
+     * Get CMSIS-DebugMCP server configuration with current port and timeout settings
      */
     private getDebugMCPConfig(): MCPServerConfig {
         return {
@@ -185,27 +185,27 @@ export class AgentConfigurationManager {
                 }
 
                 const fieldName = agent.mcpServerFieldName;
-                const debugmcpConfig = config[fieldName]?.debugmcp;
+                const debugmcpConfig = config[fieldName]?.['cmsis-debugmcp'];
 
                 if (!debugmcpConfig) {
-                    continue; // DebugMCP not configured for this agent
+                    continue; // CMSIS-DebugMCP not configured for this agent
                 }
 
                 // Check if it's using the old SSE configuration
-                const needsMigration = 
-                    debugmcpConfig.type === 'sse' || 
+                const needsMigration =
+                    debugmcpConfig.type === 'sse' ||
                     debugmcpConfig.type === 'http' ||
                     (debugmcpConfig.url && debugmcpConfig.url.endsWith('/sse'));
 
                 if (needsMigration) {
-                    console.log(`Migrating DebugMCP configuration for ${agent.displayName} from SSE to streamableHttp`);
-                    
+                    console.log(`Migrating CMSIS-DebugMCP configuration for ${agent.displayName} from SSE to streamableHttp`);
+
                     // Update to new configuration
-                    config[fieldName].debugmcp = this.getDebugMCPConfig();
-                    
+                    config[fieldName]['cmsis-debugmcp'] = this.getDebugMCPConfig();
+
                     // Preserve any custom autoApprove settings
                     if (debugmcpConfig.autoApprove && Array.isArray(debugmcpConfig.autoApprove)) {
-                        config[fieldName].debugmcp.autoApprove = debugmcpConfig.autoApprove;
+                        config[fieldName]['cmsis-debugmcp'].autoApprove = debugmcpConfig.autoApprove;
                     }
                     
                     // Write the migrated config
@@ -226,13 +226,13 @@ export class AgentConfigurationManager {
 
         if (migrationCount > 0) {
             vscode.window.showInformationMessage(
-                `DebugMCP: Migrated ${migrationCount} agent configuration(s) to use the new transport protocol.`
+                `CMSIS-DebugMCP: Migrated ${migrationCount} agent configuration(s) to use the new transport protocol.`
             );
         }
     }
 
     /**
-     * Add DebugMCP server configuration to the specified agent's config
+     * Add CMSIS-DebugMCP server configuration to the specified agent's config
      */
     private async addDebugMCPToAgent(agent: AgentInfo): Promise<boolean> {
         try {
@@ -261,21 +261,21 @@ export class AgentConfigurationManager {
                 config[fieldName] = {};
             }
 
-            // Add or update DebugMCP configuration with current settings
-            config[fieldName].debugmcp = this.getDebugMCPConfig();
+            // Add or update CMSIS-DebugMCP configuration with current settings
+            config[fieldName]['cmsis-debugmcp'] = this.getDebugMCPConfig();
 
             // Write the updated config back to file
             await fs.promises.writeFile(
-                agent.configPath, 
-                JSON.stringify(config, null, 2), 
+                agent.configPath,
+                JSON.stringify(config, null, 2),
                 'utf8'
             );
 
-            console.log(`Successfully added DebugMCP configuration to ${agent.name}`);
+            console.log(`Successfully added CMSIS-DebugMCP configuration to ${agent.name}`);
             return true;
         } catch (error) {
-            console.error(`Error adding DebugMCP to ${agent.name}:`, error);
-            vscode.window.showErrorMessage(`Failed to configure DebugMCP for ${agent.displayName}: ${error}`);
+            console.error(`Error adding CMSIS-DebugMCP to ${agent.name}:`, error);
+            vscode.window.showErrorMessage(`Failed to configure CMSIS-DebugMCP for ${agent.displayName}: ${error}`);
             return false;
         }
     }
@@ -288,7 +288,7 @@ export class AgentConfigurationManager {
         agents.forEach(agent => {
             items.push({
                 label: `$(add) Configure ${agent.displayName}`,
-                description: 'Add DebugMCP server to this agent',
+                description: 'Add CMSIS-DebugMCP server to this agent',
                 detail: agent.displayName,
                 picked: false
             });
@@ -296,8 +296,8 @@ export class AgentConfigurationManager {
 
 
         const quickPick = vscode.window.createQuickPick();
-        quickPick.title = 'DebugMCP Setup - Choose AI Agent to Configure';
-        quickPick.placeholder = 'Select an AI agent to configure with DebugMCP';
+        quickPick.title = 'CMSIS-DebugMCP Setup - Choose AI Agent to Configure';
+        quickPick.placeholder = 'Select an AI agent to configure with CMSIS-DebugMCP';
         quickPick.items = items;
         quickPick.canSelectMany = true;
         quickPick.ignoreFocusOut = true;
@@ -328,17 +328,17 @@ export class AgentConfigurationManager {
     }
 
     /**
-     * Configure a specific agent with DebugMCP
+     * Configure a specific agent with CMSIS-DebugMCP
      */
     private async configureAgent(agent: AgentInfo): Promise<void> {
         try {
             const success = await this.addDebugMCPToAgent(agent);
-            
+
             if (success) {
                 // Show success message with green pass icon and link to open config file
                 const openConfigButton = 'Open Config';
                 const result = await vscode.window.showInformationMessage(
-                    `✅ DebugMCP successfully configured for ${agent.displayName}`,
+                    `✅ CMSIS-DebugMCP successfully configured for ${agent.displayName}`,
                     openConfigButton
                 );
                 

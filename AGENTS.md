@@ -1,13 +1,24 @@
-# Agent Guidelines for DebugMCP
+# Agent Guidelines for CMSIS-DebugMCP
 
 ## Project Overview
 
-DebugMCP is a VS Code extension that embeds an MCP (Model Context Protocol) server, enabling AI coding agents to control VS Code's debugger via DAP (Debug Adapter Protocol). AI agents can start/stop debugging, step through code, set breakpoints, inspect variables, and evaluate expressions.
+CMSIS-DebugMCP is a VS Code extension (fork of microsoft/DebugMCP) that embeds an MCP (Model Context Protocol) server, enabling AI coding agents to control VS Code's debugger via DAP. It specializes in Arm Cortex-M embedded debugging through the CMSIS Debugger extension (`gdbtarget` configurations) — reading memory, core registers, peripheral registers (via SVD), and decoding Cortex-M fault status — while retaining general multi-language debugging support.
 
 ### Architecture
 
 ```
-AI Agent (Cline/Copilot/Cursor) → MCP/SSE → DebugMCPServer → DebuggingHandler → DebuggingExecutor → VS Code Debug API
+AI Agent (Cline/Copilot/Cursor) → MCP/HTTP → DebugMCPServer → DebuggingHandler → DebuggingExecutor → VS Code Debug API
+                                                                                                       │
+                                                                                            ┌──────────┴──────────┐
+                                                                                    gdbtarget (CMSIS)        other debug types
+                                                                                            │
+                                                                                   CDT GDB Debug Adapter
+                                                                                            │
+                                                                                    arm-none-eabi-gdb
+                                                                                            │
+                                                                                   pyOCD / J-Link GDB Server
+                                                                                            │
+                                                                                    SWD/JTAG → Cortex-M target
 ```
 
 ### Key Components
@@ -68,14 +79,14 @@ Include in each source file:
 ## Entry Points
 
 - **Extension activation**: `src/extension.ts` → `activate()`
-- **MCP endpoint**: `http://localhost:{port}/sse` (default port: 3001)
+- **MCP endpoint**: `http://localhost:{port}/mcp` (default port: 3001, Streamable HTTP transport)
 
 ## Configuration
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `debugmcp.serverPort` | 3001 | MCP server port |
-| `debugmcp.timeoutInSeconds` | 180 | Operation timeout |
+| `cmsis-debugmcp.serverPort` | 3001 | MCP server port |
+| `cmsis-debugmcp.timeoutInSeconds` | 180 | Operation timeout |
 
 ## Documentation Resources
 
@@ -85,9 +96,11 @@ The `docs/` folder contains two types of documentation:
 
 **AI Agent resources** (served via MCP at runtime):
 
-| File | Purpose |
-|------|---------|
-| `agent-resources/debug_instructions.md` | Core debugging workflow guide for AI agents |
-| `agent-resources/troubleshooting/*.md` | Language-specific debugging tips (Python, JavaScript, Java, C#) |
+| Resource URI | Source file | Purpose |
+|------|---------|---------|
+| `cmsis-debugmcp://docs/debug_instructions` | `agent-resources/debug_instructions.md` | Core debugging workflow guide |
+| `cmsis-debugmcp://docs/cmsis-embedded-guide` | `agent-resources/cmsis-embedded-guide.md` | Cortex-M debugging expertise |
+| `cmsis-debugmcp://docs/troubleshooting/embedded` | `agent-resources/troubleshooting/embedded.md` | Embedded-specific tips |
+| `cmsis-debugmcp://docs/troubleshooting/<lang>` | `agent-resources/troubleshooting/<lang>.md` | Language-specific tips |
 
 These resource files are loaded by `DebugMCPServer` and exposed as MCP resources that AI agents can read to learn how to use the debugging tools effectively.

@@ -1,4 +1,4 @@
-# DebugMCP - Debugging Instructions Guide
+# CMSIS-DebugMCP - Debugging Instructions Guide
 
 ⚠️  **CRITICAL INSTRUCTIONS - FOLLOW THESE STEPS:**
 1. **FIRST:** Use 'add_breakpoint' to set an initial breakpoint at a starting point

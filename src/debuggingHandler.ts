@@ -10,7 +10,7 @@ import { logger } from './utils/logger';
  * Interface for debugging handler operations
  */
 export interface IDebuggingHandler {
-    handleStartDebugging(args: { fileFullPath: string; workingDirectory: string; testName?: string; configurationName?: string }): Promise<string>;
+    handleStartDebugging(args: { fileFullPath?: string; workingDirectory: string; testName?: string; configurationName?: string }): Promise<string>;
     handleStopDebugging(): Promise<string>;
     handleStepOver(): Promise<string>;
     handleStepInto(): Promise<string>;
@@ -23,6 +23,11 @@ export interface IDebuggingHandler {
     handleListBreakpoints(): Promise<string>;
     handleGetVariables(args: { scope?: 'local' | 'global' | 'all' }): Promise<string>;
     handleEvaluateExpression(args: { expression: string }): Promise<string>;
+    handleReadMemory(args: { address: string; length: number; format?: 'hex' | 'ascii' | 'both' }): Promise<string>;
+    handleReadCoreRegisters(): Promise<string>;
+    handleReadPeripheralRegister(args: { peripheral: string; register?: string }): Promise<string>;
+    handleGetFaultInfo(): Promise<string>;
+    handleGetDeviceInfo(): Promise<string>;
 }
 
 /**
@@ -45,7 +50,7 @@ export class DebuggingHandler implements IDebuggingHandler {
      * Start a debugging session
      */
     public async handleStartDebugging(args: { 
-        fileFullPath: string; 
+        fileFullPath?: string; 
         workingDirectory: string;
         testName?: string;
         configurationName?: string;
@@ -55,6 +60,27 @@ export class DebuggingHandler implements IDebuggingHandler {
         try {            
             let selectedConfigName = configurationName ?? await this.configManager.promptForConfiguration(workingDirectory);
             
+            // For named configurations (e.g. gdbtarget/CMSIS), pass the name directly
+            // to vscode.debug.startDebugging without requiring fileFullPath
+            if (selectedConfigName && selectedConfigName !== 'Default Configuration') {
+                const started = await this.executor.startDebuggingByName(workingDirectory, selectedConfigName);
+                if (started) {
+                    const sessionActive = await this.waitForActiveDebugSession();
+                    if (!sessionActive) {
+                        throw new Error('Debug session started but failed to become active within timeout period');
+                    }
+                    const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
+                    const target = fileFullPath || selectedConfigName;
+                    return `Debug session started successfully for: ${target} using configuration '${selectedConfigName}'. Current state: ${currentState.toString()}`;
+                } else {
+                    throw new Error(`Failed to start debug session with configuration '${selectedConfigName}'.`);
+                }
+            }
+
+            if (!fileFullPath) {
+                throw new Error('fileFullPath is required when no named configuration is provided.');
+            }
+
             // Get debug configuration from launch.json or create default
             const debugConfig = await this.configManager.getDebugConfig(
                 workingDirectory, 
@@ -130,13 +156,11 @@ export class DebuggingHandler implements IDebuggingHandler {
                 throw new Error('Debug session is not ready. Please wait for initialization to complete.');
             }
 
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
             await this.executor.stepOver();
             
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
+            // Wait for the target to stop — event-driven, no DAP polling
+            // while the CPU is running (same approach as handleContinue).
+            const afterState = await this.waitForTargetStopped();
 
             return afterState.toString();
         } catch (error) {
@@ -153,13 +177,11 @@ export class DebuggingHandler implements IDebuggingHandler {
                 throw new Error('Debug session is not ready. Please wait for initialization to complete.');
             }
 
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
             await this.executor.stepInto();
             
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
+            // Wait for the target to stop — event-driven, no DAP polling
+            // while the CPU is running (same approach as handleContinue).
+            const afterState = await this.waitForTargetStopped();
             
             return afterState.toString();
         } catch (error) {
@@ -176,13 +198,11 @@ export class DebuggingHandler implements IDebuggingHandler {
                 throw new Error('Debug session is not ready. Please wait for initialization to complete.');
             }
 
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
             await this.executor.stepOut();
             
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
+            // Wait for the target to stop — event-driven, no DAP polling
+            // while the CPU is running (same approach as handleContinue).
+            const afterState = await this.waitForTargetStopped();
             
             return afterState.toString();
         } catch (error) {
@@ -199,13 +219,13 @@ export class DebuggingHandler implements IDebuggingHandler {
                 throw new Error('Debug session is not ready. Please wait for initialization to complete.');
             }
 
-            // Get the state before executing the command
-            const beforeState = await this.executor.getCurrentDebugState(this.numNextLines);
-
             await this.executor.continue();
             
-            // Wait for debugger state to change
-            const afterState = await this.waitForStateChange(beforeState);
+            // Wait for the target to stop (breakpoint, fault, etc.)
+            // Do NOT poll debug state while the target is running — on embedded
+            // targets, DAP requests like stackTrace while the CPU is executing
+            // will crash the debug session.
+            const afterState = await this.waitForTargetStopped();
             
             return afterState.toString();
         } catch (error) {
@@ -348,13 +368,24 @@ export class DebuggingHandler implements IDebuggingHandler {
                 throw new Error('No active stack frame. Make sure execution is paused at a breakpoint.');
             }
 
-            const variablesData = await this.executor.getVariables(activeStackItem.frameId, scope);
+            let variablesData = await this.executor.getVariables(activeStackItem.frameId, scope);
             
+            // If 'global' scope was requested but not available, fall back to returning all scopes
+            let globalFallback = false;
+            if (scope === 'global' && (!variablesData.scopes || variablesData.scopes.length === 0)) {
+                variablesData = await this.executor.getVariables(activeStackItem.frameId, 'all');
+                globalFallback = true;
+            }
+
             if (!variablesData.scopes || variablesData.scopes.length === 0) {
                 return 'No variable scopes available at current execution point.';
             }
 
-            let variablesInfo = 'Variables:\n==========\n\n';
+            let variablesInfo = '';
+            if (globalFallback) {
+                variablesInfo += 'Note: No dedicated "Global" scope is available from this debug adapter. Showing all available scopes instead. Use evaluate_expression to inspect specific global variables by name.\n\n';
+            }
+            variablesInfo += 'Variables:\n==========\n\n';
 
             for (const scopeItem of variablesData.scopes) {
                 variablesInfo += `${scopeItem.name}:\n`;
@@ -457,6 +488,45 @@ export class DebuggingHandler implements IDebuggingHandler {
         }
         
         return false; // Timeout reached
+    }
+
+    /**
+     * Wait for the target to stop after a continue/step command.
+     * Uses vscode.debug.onDidChangeActiveStackItem which fires when the debugger
+     * stops and a stack frame becomes available — safe for embedded targets.
+     */
+    private async waitForTargetStopped(): Promise<DebugState> {
+        return new Promise<DebugState>((resolve) => {
+            const timeoutMs = this.timeoutInSeconds * 1000;
+            let settled = false;
+
+            const settle = async () => {
+                if (settled) { return; }
+                settled = true;
+                disposable.dispose();
+                clearTimeout(timer);
+                // Small delay to let VS Code update the active editor/cursor
+                await new Promise(r => setTimeout(r, 300));
+                resolve(await this.executor.getCurrentDebugState(this.numNextLines));
+            };
+
+            // Listen for when a stack frame becomes active (= target stopped)
+            const disposable = vscode.debug.onDidChangeActiveStackItem(() => {
+                settle();
+            });
+
+            // Also listen for session termination
+            const sessionDisposable = vscode.debug.onDidTerminateDebugSession(() => {
+                sessionDisposable.dispose();
+                settle();
+            });
+
+            // Timeout fallback
+            const timer = setTimeout(() => {
+                logger.info('waitForTargetStopped timed out');
+                settle();
+            }, timeoutMs);
+        });
     }
 
     /**
@@ -572,5 +642,156 @@ REQUIRED NEXT STEPS:
 2. Use 'start_debugging' to trace from the beginning
 3. Investigate WHY the issue occurred, not just WHAT happened
 4. Repeat the process as necessary until the ROOT CAUSE is identified`;
+    }
+
+    // ========== Embedded / Cortex-M tool handlers ==========
+
+    /**
+     * Read target memory
+     */
+    public async handleReadMemory(args: { address: string; length: number; format?: 'hex' | 'ascii' | 'both' }): Promise<string> {
+        const { address, length, format = 'both' } = args;
+
+        try {
+            if (!(await this.executor.hasActiveSession())) {
+                throw new Error('No active debug session. Start debugging first.');
+            }
+
+            const data = await this.executor.readMemory(address, length);
+
+            // Normalize and parse address using BigInt to handle full 32-bit range
+            const addrStr = address.startsWith('0x') || address.startsWith('0X') ? address : `0x${address}`;
+            const baseAddr = BigInt(addrStr);
+
+            let result = `Memory at ${addrStr} (${length} bytes):\n`;
+
+            if (format === 'hex' || format === 'both') {
+                result += '\nHex:\n';
+                for (let i = 0; i < data.length; i += 16) {
+                    const slice = data.subarray(i, Math.min(i + 16, data.length));
+                    const addr = (baseAddr + BigInt(i)).toString(16).padStart(8, '0');
+                    const hex = Array.from(slice).map(b => b.toString(16).padStart(2, '0')).join(' ');
+                    result += `  0x${addr}: ${hex}\n`;
+                }
+            }
+
+            if (format === 'ascii' || format === 'both') {
+                result += '\nASCII:\n  ';
+                for (let i = 0; i < data.length; i++) {
+                    const ch = data[i];
+                    result += (ch >= 0x20 && ch < 0x7F) ? String.fromCharCode(ch) : '.';
+                    if ((i + 1) % 64 === 0) { result += '\n  '; }
+                }
+                result += '\n';
+            }
+
+            return result;
+        } catch (error) {
+            throw new Error(`Error reading memory: ${error}`);
+        }
+    }
+
+    /**
+     * Normalize a GDB register value string to hex format.
+     * Converts pure decimal to 0x hex, strips symbol annotations from hex values.
+     * Keeps decoded formats (e.g. "[ Z C GE=0 ]") as-is.
+     */
+    private normalizeRegToHex(raw: string): string {
+        const trimmed = raw.trim();
+        if (!trimmed || trimmed === '<?>') { return trimmed; }
+
+        // Decoded format like "[ Z C GE=0 EXC=0 T ]" — keep as-is
+        if (trimmed.startsWith('[')) { return trimmed; }
+
+        // Already hex (0x…) — strip symbol annotation like " <main+12>"
+        if (trimmed.startsWith('0x') || trimmed.startsWith('0X')) {
+            const hexMatch = trimmed.match(/^(0x[0-9a-fA-F]+)/);
+            return hexMatch ? hexMatch[1] : trimmed;
+        }
+
+        // Pure decimal — convert to 0x hex (32-bit unsigned)
+        const num = parseInt(trimmed, 10);
+        if (!isNaN(num) && num >= 0) {
+            return '0x' + (num >>> 0).toString(16).padStart(8, '0');
+        }
+
+        return trimmed;
+    }
+
+    /**
+     * Read Cortex-M core registers
+     */
+    public async handleReadCoreRegisters(): Promise<string> {
+        try {
+            if (!(await this.executor.hasActiveSession())) {
+                throw new Error('No active debug session. Start debugging first.');
+            }
+
+            const regs = await this.executor.readCoreRegisters();
+
+            let result = 'Core Registers:\n';
+            const rows: string[][] = [
+                ['r0', 'r1', 'r2', 'r3'],
+                ['r4', 'r5', 'r6', 'r7'],
+                ['r8', 'r9', 'r10', 'r11'],
+                ['r12', 'sp', 'lr', 'pc'],
+            ];
+            for (const row of rows) {
+                result += '  ' + row.map(r => `${r.padEnd(4)}= ${this.normalizeRegToHex(regs[r] || '<?>').padEnd(14)}`).join('') + '\n';
+            }
+            result += `  xpsr = ${regs['xpsr'] || '<?>'}\n`;
+            result += `  msp  = ${this.normalizeRegToHex(regs['msp'] || '<?>')}\n`;
+            result += `  psp  = ${this.normalizeRegToHex(regs['psp'] || '<?>')}\n`;
+            result += `  control   = ${regs['control'] || '<?>'}\n`;
+            result += `  faultmask = ${this.normalizeRegToHex(regs['faultmask'] || '<?>')}\n`;
+            result += `  basepri   = ${this.normalizeRegToHex(regs['basepri'] || '<?>')}\n`;
+            result += `  primask   = ${this.normalizeRegToHex(regs['primask'] || '<?>')}\n`;
+
+            return result;
+        } catch (error) {
+            throw new Error(`Error reading core registers: ${error}`);
+        }
+    }
+
+    /**
+     * Read peripheral register(s) via Peripheral Inspector or memory fallback
+     */
+    public async handleReadPeripheralRegister(args: { peripheral: string; register?: string }): Promise<string> {
+        try {
+            if (!(await this.executor.hasActiveSession())) {
+                throw new Error('No active debug session. Start debugging first.');
+            }
+            return await this.executor.readPeripheralRegister(args.peripheral, args.register);
+        } catch (error) {
+            throw new Error(`Error reading peripheral register: ${error}`);
+        }
+    }
+
+    /**
+     * Read and decode Cortex-M fault registers
+     */
+    public async handleGetFaultInfo(): Promise<string> {
+        try {
+            if (!(await this.executor.hasActiveSession())) {
+                throw new Error('No active debug session. Start debugging first.');
+            }
+            return await this.executor.getFaultInfo();
+        } catch (error) {
+            throw new Error(`Error reading fault info: ${error}`);
+        }
+    }
+
+    /**
+     * Get debug target / session information
+     */
+    public async handleGetDeviceInfo(): Promise<string> {
+        try {
+            if (!(await this.executor.hasActiveSession())) {
+                throw new Error('No active debug session. Start debugging first.');
+            }
+            return await this.executor.getDeviceInfo();
+        } catch (error) {
+            throw new Error(`Error getting device info: ${error}`);
+        }
     }
 }
