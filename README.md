@@ -1,29 +1,24 @@
-# DebugMCP (MCP Server) - Empowering AI Agents with Multi-Language Debugging Capabilities
+# CMSIS-DebugMCP — AI-Driven Debugging for Arm Cortex-M Targets
 
-Let AI agents debug your code inside VS Code — set breakpoints, step through execution, inspect variables, and evaluate expressions. Works with **GitHub Copilot**, **Cline**, **Cursor**, and any MCP-compatible assistant. Supports **Python**, **JavaScript/TypeScript**, **Java**, **C#**, **C++**, **Go**, **Rust**, **PHP**, and **Ruby**.
+CMSIS-DebugMCP is an MCP server that lets an AI agent drive the VS Code debugger against Arm Cortex-M targets through the **CMSIS Debugger** extension — setting breakpoints, stepping, reading memory and core registers, decoding fault status, and inspecting peripheral registers via SVD. It also retains general multi-language debugging support (Python, JavaScript/TypeScript, Java, C#, C++, Go, Rust, PHP, Ruby) inherited from the upstream DebugMCP project.
 
-> **📢 Beta Version Notice**: This is a beta version of DebugMCP maintained by [ozzafar@microsoft.com](mailto:ozzafar@microsoft.com) and [orbarila@microsoft.com](mailto:orbarila@microsoft.com). We welcome feedback and contributions to help improve this extension.
+Works with **GitHub Copilot**, **Cline**, **Cursor**, and any MCP-compatible assistant.
+
+> This project is a fork of [microsoft/DebugMCP](https://github.com/microsoft/DebugMCP) extended for Arm embedded workflows. See [CHANGELOG.md](CHANGELOG.md) for the list of embedded-specific additions.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.104.0+-blue.svg)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-1.0.9-green.svg)](https://github.com/microsoft/DebugMCP)
-[![VS Marketplace](https://img.shields.io/badge/VS%20Marketplace-Install-blue.svg)](https://marketplace.visualstudio.com/items?itemName=ozzafar.debugmcpextension)
-
-> Watch DebugMCP in action — your AI assistant autonomously sets breakpoints, steps through code, and inspects variables directly in VS Code.
+[![Version](https://img.shields.io/badge/version-1.0.9-green.svg)](https://github.com/mather01/DebugMCP)
 
 <p align="center">
-  <img src="assets/DebugMCP.webp" alt="DebugMCP Demo" width="800">
+  <img src="assets/DebugMCP.webp" alt="CMSIS-DebugMCP Demo" width="800">
 </p>
-
-## 🚀 Quick Install
-
-**[Install from VS Code Marketplace](https://marketplace.visualstudio.com/items?itemName=ozzafar.debugmcpextension)** or use the direct link: `vscode:extension/ozzafar.debugmcpextension`
 
 ## Table of Contents
 - [Overview](#overview)
 - [Features](#features)
 - [Installation](#installation)
-- [Quick Start](#quick-start)
+- [Quick Start — CMSIS Target](#quick-start--cmsis-target)
 - [Supported Languages](#supported-languages)
 - [Configuration](#configuration)
 - [Troubleshooting](#troubleshooting)
@@ -32,16 +27,16 @@ Let AI agents debug your code inside VS Code — set breakpoints, step through e
 
 ## Overview
 
-DebugMCP is an MCP server that gives AI coding agents full control over the VS Code debugger. Instead of reading logs or guessing, your AI assistant can autonomously set breakpoints, launch debug sessions, step through code line by line, inspect variable values, and evaluate expressions — just like a human developer would. It runs 100% locally, requires zero configuration, and works out of the box with any MCP-compatible AI assistant.
+CMSIS-DebugMCP is an MCP server that gives AI coding agents full control over the VS Code debugger. For embedded Arm Cortex-M development it delegates to the **CMSIS Debugger** extension (`arm.vscode-cmsis-debugger`) via `gdbtarget` launch configurations produced by CMSIS Solution, driving pyOCD or J-Link GDB Server against real hardware such as the Alif Semiconductor AppKit. It also retains the upstream DebugMCP behavior for general multi-language debugging. It runs 100% locally, requires no credentials, and works out of the box with any MCP-compatible AI assistant.
 
 ## Features
 
-### 🔧 Tools
+### 🔧 Core Debug Tools
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
 | **get_debug_instructions** | Get the debugging guide with best practices and workflow instructions | None |
-| **start_debugging** | Start a debug session for a source code file | `fileFullPath` (required)<br>`workingDirectory` (required)<br>`testName` (optional)<br>`configurationName` (optional) |
+| **start_debugging** | Start a debug session — pass `configurationName` to launch a `gdbtarget`/CMSIS config from `launch.json` | `configurationName` (optional)<br>`fileFullPath` (optional when `configurationName` is provided)<br>`workingDirectory` (optional)<br>`testName` (optional) |
 | **stop_debugging** | Stop the current debug session | None |
 | **step_over** | Execute the next line (step over function calls) | None |
 | **step_into** | Step into function calls | None |
@@ -55,11 +50,28 @@ DebugMCP is an MCP server that gives AI coding agents full control over the VS C
 | **get_variables_values** | Get variables and their values at current execution point | `scope` (optional: 'local', 'global', 'all') |
 | **evaluate_expression** | Evaluate an expression in debug context | `expression` (required) |
 
+### 🧠 Embedded / Cortex-M Tools
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| **read_memory** | Read a range of bytes from the target | `address` (hex string, e.g. `0x20000000`)<br>`length` (1-4096 bytes)<br>`format` (`hex` / `ascii` / `both`) |
+| **read_core_registers** | Read Cortex-M core registers (R0–R15, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK) | None |
+| **read_peripheral_register** | Read peripheral registers using SVD definitions (via Peripheral Inspector or SVD fallback) | `peripheral` (e.g. `GPIOA`)<br>`register` (optional; omit to list all registers of the peripheral) |
+| **get_fault_info** | Read and decode CFSR / HFSR / DFSR / MMFAR / BFAR / AFSR for HardFault analysis | None |
+| **get_device_info** | Return session info: device, probe, processor, GDB server, ports | None |
+
+### 📚 MCP Resources
+
+- `cmsis-debugmcp://docs/debug_instructions` — general debugging workflow guide
+- `cmsis-debugmcp://docs/cmsis-embedded-guide` — Cortex-M debugging expertise (fault decode recipes, memory map, key system registers, RTOS tips)
+- `cmsis-debugmcp://docs/troubleshooting/embedded` — embedded-specific troubleshooting
+- `cmsis-debugmcp://docs/troubleshooting/<language>` — language-specific troubleshooting (python, java, csharp, …)
+
 > **Note:** The `get_debug_instructions` tool is particularly useful for AI clients like GitHub Copilot that don't support MCP resources. It provides the same debugging guide content that is also available as an MCP resource.
 
 ### 🎯 Debugging Best Practices
 
-DebugMCP follows systematic debugging practices for effective issue resolution:
+CMSIS-DebugMCP follows systematic debugging practices for effective issue resolution:
 
 - **Start with Entry Points**: Begin debugging at function entry points or main execution paths
 - **Follow the Execution Flow**: Use step-by-step execution to understand code flow
@@ -72,45 +84,48 @@ DebugMCP follows systematic debugging practices for effective issue resolution:
 
 ## Installation
 
-### Quick Install Options
+### From source (VSIX)
 
-**Option 1: Direct Link** (Fastest)
-- Click this link: [vscode:extension/ozzafar.debugmcpextension](vscode:extension/ozzafar.debugmcpextension)
-- Or copy and paste in your browser: `vscode:extension/ozzafar.debugmcpextension`
+```bash
+git clone https://github.com/mather01/DebugMCP.git
+cd DebugMCP
+npm install
+npm run compile
+npx vsce package
+code --install-extension cmsis-debugmcp-1.0.9.vsix
+```
 
-**Option 2: VS Code Marketplace**
-- Visit: [https://marketplace.visualstudio.com/items?itemName=ozzafar.debugmcpextension](https://marketplace.visualstudio.com/items?itemName=ozzafar.debugmcpextension)
-- Click "Install"
+The extension activates on startup and registers an MCP server on `http://localhost:3001/mcp` by default.
 
-**Option 3: Within VS Code**
-1. Open VSCode
-2. Go to Extensions (Ctrl+Shift+X / Cmd+Shift+X)
-3. Search for "DebugMCP"
-4. Click Install
-5. The extension automatically activates and registers as an MCP server
+### Recommended companion extensions
 
-### Verification
-After installation, you should see:
-- DebugMCP extension in your installed extensions
-- MCP server automatically running on port 3001 (configurable)
-- Debug tools available to connected AI assistants
+For embedded Arm Cortex-M workflows, install the following alongside CMSIS-DebugMCP:
 
-> **📝 Note**: No additional debugging rule instructions are needed - the extension works out of the box.
+- **Arm CMSIS Debugger** (`arm.vscode-cmsis-debugger`) — provides the `gdbtarget` launch configuration provider and ships pyOCD.
+- **CDT GDB Debug Adapter** (`eclipse-cdt.cdt-gdb-vscode`) — DAP-to-GDB-MI adapter used by `gdbtarget` sessions.
+- **Peripheral Inspector** (`eclipse-cdt.peripheral-inspector`) — optional, used by `read_peripheral_register` when available (falls back to SVD parsing + `readMemory`).
+- **Arm CMSIS Solution** (`arm.cmsis-csolution`) — generates `launch.json` entries of type `gdbtarget` from a csolution project.
 
-> **💡 Tip**: Enable auto-approval for all debugmcp tools in your AI assistant to create seamless debugging workflows without constant approval interruptions.
+> **💡 Tip**: Enable auto-approval for all CMSIS-DebugMCP tools in your AI assistant to create seamless debugging workflows without constant approval interruptions.
 
-## Quick Start
+## Quick Start — CMSIS Target
 
-1. **Install the extension** (see [Installation](#installation))
-2. **Open your project** in VSCode
-3. **Ask your AI to debug** - it can now set breakpoints, start debugging, and analyze your code!
+1. Open a CMSIS Solution project that produces a `.vscode/launch.json` with a `gdbtarget` configuration (e.g., `"CMSIS Debugger: pyOCD"` or `"CMSIS Debugger: J-LINK"`).
+2. Ensure the AI assistant has CMSIS-DebugMCP registered as an MCP server (the extension offers auto-registration on first launch).
+3. Ask your agent: *"Start debugging using configuration 'CMSIS Debugger: pyOCD'"* — the agent calls `start_debugging` with `configurationName` set, and CMSIS-DebugMCP passes the named config straight through to `vscode.debug.startDebugging()`.
+4. After the target halts at `main`, ask the agent to read core registers, inspect memory, decode faults, or read peripheral registers.
 
-## Supported Languages
+## Quick Start — General Languages
 
-DebugMCP supports debugging for the following languages with their respective VSCode extensions:
+1. Install the extension.
+2. Open your project in VS Code.
+3. Ask your AI to debug — it can set breakpoints, start debugging, and analyze your code using the auto-generated launch configuration for the file's language.
 
-| Language | Extension Required | File Extensions | Status |
+## Supported Languages & Targets
+
+| Language / Target | Extension Required | File Extensions | Status |
 |----------|-------------------|-----------------|---------|
+| **Arm Cortex-M (gdbtarget)** | [Arm CMSIS Debugger](https://marketplace.visualstudio.com/items?itemName=Arm.vscode-cmsis-debugger) + [CDT GDB Debug Adapter](https://marketplace.visualstudio.com/items?itemName=eclipse-cdt.cdt-gdb-vscode) | `.axf`, `.elf` | ✅ Primary target |
 | **Python** | [Python](https://marketplace.visualstudio.com/items?itemName=ms-python.python) | `.py` | ✅ Fully Supported |
 | **JavaScript/TypeScript** | Built-in / [JS Debugger](https://marketplace.visualstudio.com/items?itemName=ms-vscode.js-debug) | `.js`, `.ts`, `.jsx`, `.tsx` | ✅ Fully Supported |
 | **Java** | [Extension Pack for Java](https://marketplace.visualstudio.com/items?itemName=vscjava.vscode-java-pack) | `.java` | ✅ Fully Supported |
@@ -129,17 +144,15 @@ The extension runs an MCP server automatically. It will pop up a message to auto
 
 ### Manual MCP Server Registration (Optional)
 
-> **🔄 Auto-Migration**: If you previously configured DebugMCP with SSE transport, the extension will automatically migrate your configuration to the new Streamable HTTP transport on activation.
-
 #### Cline
 Add to your Cline settings or `cline_mcp_settings.json`:
 ```json
 {
   "mcpServers": {
-    "debugmcp": {
+    "cmsis-debugmcp": {
       "type": "streamableHttp",
       "url": "http://localhost:3001/mcp",
-      "description": "DebugMCP - AI-powered debugging assistant"
+      "description": "CMSIS-DebugMCP - AI-driven Cortex-M debugging"
     }
   }
 }
@@ -151,10 +164,10 @@ Add to your VS Code settings (`settings.json`):
 {
   "mcp": {
     "servers": {
-      "debugmcp": {
+      "cmsis-debugmcp": {
         "type": "http",
         "url": "http://localhost:3001/mcp",
-        "description": "DebugMCP - Multi-language debugging support"
+        "description": "CMSIS-DebugMCP - Cortex-M and multi-language debugging"
       }
     }
   }
@@ -166,10 +179,10 @@ Add to Cursor's MCP settings:
 ```json
 {
   "mcpServers": {
-    "debugmcp": {
+    "cmsis-debugmcp": {
       "type": "streamableHttp",
       "url": "http://localhost:3001/mcp",
-      "description": "DebugMCP - Debugging tools for AI assistants"
+      "description": "CMSIS-DebugMCP - Debugging tools for AI assistants"
     }
   }
 }
@@ -177,19 +190,19 @@ Add to Cursor's MCP settings:
 
 ### Extension Settings
 
-Configure DebugMCP behavior in VSCode settings:
+Configure CMSIS-DebugMCP behavior in VSCode settings:
 
 ```json
 {
-  "debugmcp.serverPort": 3001,
-  "debugmcp.timeoutInSeconds": 180
+  "cmsis-debugmcp.serverPort": 3001,
+  "cmsis-debugmcp.timeoutInSeconds": 180
 }
 ```
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `debugmcp.serverPort` | `3001` | Port number for the MCP server |
-| `debugmcp.timeoutInSeconds` | `180` | Timeout for debugging operations |
+| `cmsis-debugmcp.serverPort` | `3001` | Port number for the MCP server |
+| `cmsis-debugmcp.timeoutInSeconds` | `180` | Timeout for debugging operations |
 
 
 ## FAQ
@@ -197,43 +210,45 @@ Configure DebugMCP behavior in VSCode settings:
 <details>
 <summary><b>Which AI assistants are supported?</b></summary>
 
-DebugMCP works with any MCP-compatible AI assistant, including **GitHub Copilot**, **Cline**, **Cursor**, **Roo Code**, **Windsurf**, and others. If your assistant supports the Model Context Protocol, it can use DebugMCP.
+CMSIS-DebugMCP works with any MCP-compatible AI assistant, including **GitHub Copilot**, **Cline**, **Cursor**, **Roo Code**, **Windsurf**, and others. If your assistant supports the Model Context Protocol, it can use CMSIS-DebugMCP.
 </details>
 
 <details>
 <summary><b>Does it work with VS Code Remote SSH / Codespaces / WSL?</b></summary>
 
-Yes. DebugMCP runs as a VS Code extension with `extensionKind: workspace`, so it activates in the remote environment where your code lives. The MCP server runs on `localhost` within that remote context.
+Yes. CMSIS-DebugMCP runs as a VS Code extension with `extensionKind: workspace`, so it activates in the remote environment where your code lives. The MCP server runs on `localhost` within that remote context.
 </details>
 
 <details>
 <summary><b>Do I need to configure launch.json?</b></summary>
 
-No. DebugMCP automatically generates appropriate debug configurations based on the file's language/extension. If you have a `launch.json`, it will use matching configurations from there. You can also specify a configuration by name using the `configurationName` parameter.
+For CMSIS / `gdbtarget` sessions — yes. Generate one via the CMSIS Solution extension and pass its name as `configurationName` to `start_debugging`. CMSIS-DebugMCP passes named configurations straight through to `vscode.debug.startDebugging()` without modification.
+
+For other languages — no. CMSIS-DebugMCP can auto-generate a debug configuration based on file extension. If you have a `launch.json`, it will use matching configurations from there.
 </details>
 
 <details>
 <summary><b>Is my code sent to any external service?</b></summary>
 
-No. DebugMCP runs 100% locally. The MCP server runs on `localhost`, and no code, variables, or debug data is sent to any external service. The AI assistant communicates with the MCP server entirely within your local machine.
+No. CMSIS-DebugMCP runs 100% locally. The MCP server runs on `localhost`, and no code, variables, or debug data is sent to any external service. The AI assistant communicates with the MCP server entirely within your local machine.
 </details>
 
 <details>
 <summary><b>What if port 3001 is already in use?</b></summary>
 
-Change the port in VS Code settings: `"debugmcp.serverPort": 3002` (or any available port). Then update your AI assistant's MCP configuration to use the new port.
+Change the port in VS Code settings: `"cmsis-debugmcp.serverPort": 3002` (or any available port). Then update your AI assistant's MCP configuration to use the new port.
 </details>
 
 <details>
 <summary><b>Can I debug unit tests?</b></summary>
 
-Yes. Pass the `testName` parameter to `start_debugging` to debug a specific test method. DebugMCP will configure the debug session to run and pause at breakpoints within that test.
+Yes. Pass the `testName` parameter to `start_debugging` to debug a specific test method. CMSIS-DebugMCP will configure the debug session to run and pause at breakpoints within that test.
 </details>
 
 <details>
 <summary><b>Why is my AI assistant not using the debug tools?</b></summary>
 
-Make sure DebugMCP is registered in your AI assistant's MCP settings. The extension should auto-detect and offer to register itself. If not, see the [Manual MCP Server Registration](#manual-mcp-server-registration-optional) section. Also enable auto-approval for DebugMCP tools for a smoother workflow.
+Make sure CMSIS-DebugMCP is registered in your AI assistant's MCP settings. The extension should auto-detect and offer to register itself. If not, see the [Manual MCP Server Registration](#manual-mcp-server-registration-optional) section. Also enable auto-approval for CMSIS-DebugMCP tools for a smoother workflow.
 </details>
 
 ## Troubleshooting
@@ -241,28 +256,44 @@ Make sure DebugMCP is registered in your AI assistant's MCP settings. The extens
 ### Common Issues
 
 #### MCP Server Not Starting
-- **Symptom**: AI assistant can't connect to DebugMCP
+- **Symptom**: AI assistant can't connect to CMSIS-DebugMCP
 - **Solution**: 
   - Check if port 3001 is available
   - Restart VSCode
   - Verify extension is installed and activated
 
+#### CMSIS `gdbtarget` Session Fails to Launch
+- **Symptom**: `start_debugging` returns an error when `configurationName` is a `gdbtarget` config
+- **Solution**:
+  - Verify the named configuration exists in `.vscode/launch.json`
+  - Ensure the **Arm CMSIS Debugger** and **CDT GDB Debug Adapter** extensions are installed
+  - Check that the `program` path (`.axf`/`.elf`) referenced by the configuration exists
+  - Confirm the GDB server (pyOCD or J-Link) is available on your `PATH`
+
 ## How It Works
 
 ### Architecture
 
-<p align="center">
-  <img src="assets/architecture.png" alt="DebugMCP Architecture" width="800">
-</p>
+```
+AI Agent ──MCP/HTTP──► CMSIS-DebugMCP (VS Code extension)
+                         │
+                         ├── vscode.debug.* ─► CDT GDB Debug Adapter (gdbtarget)
+                         │                       │
+                         │                   arm-none-eabi-gdb (GDB MI)
+                         │                       │
+                         │                   pyOCD / J-Link GDB Server
+                         │                       │
+                         │                   SWD/JTAG ─► Cortex-M target
+                         │
+                         └── Peripheral Inspector API / SVD parser → register decode
+```
 
 ### Launch Configuration Integration
 The extension handles debug configurations intelligently:
 
-- **Existing launch.json**: If a `.vscode/launch.json` file exists, it will:
-   - Search for a relevant configuration
-   - Use a specific configuration if found
-
-- **Default Configuration**: If no launch.json exists or no relevant config, it creates an appropriate default configurations for each language based on file extension detection
+- **Named configuration passthrough**: When `start_debugging` is called with `configurationName`, CMSIS-DebugMCP resolves the entry from `.vscode/launch.json` and passes it directly to `vscode.debug.startDebugging()` — no language detection, no config rewriting. This is how `gdbtarget`/CMSIS configs are launched.
+- **Existing launch.json**: If a `.vscode/launch.json` exists and no `configurationName` is given, a matching configuration is chosen based on the source file's language.
+- **Default configuration**: If no launch.json exists and no `configurationName` is given, an appropriate default configuration is synthesized per language based on file-extension detection.
 
 
 ## Requirements
@@ -290,43 +321,14 @@ npm run compile
 
 ## Contributing
 
-This project welcomes contributions and suggestions. Most contributions require you to agree to a
-Contributor License Agreement (CLA) declaring that you have the right to, and actually do, grant us
-the rights to use your contribution. For details, visit https://cla.opensource.microsoft.com.
-
-When you submit a pull request, a CLA bot will automatically determine whether you need to provide
-a CLA and decorate the PR appropriately (e.g., status check, comment). Simply follow the instructions
-provided by the bot. You will only need to do this once across all repos using our CLA.
-
-This project has adopted the [Microsoft Open Source Code of Conduct](https://opensource.microsoft.com/codeofconduct/).
-For more information see the [Code of Conduct FAQ](https://opensource.microsoft.com/codeofconduct/faq/) or
-contact [opencode@microsoft.com](mailto:opencode@microsoft.com) with any additional questions or comments.
+This project is a fork of [microsoft/DebugMCP](https://github.com/microsoft/DebugMCP) and contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for details. Upstream contributions that go back to DebugMCP remain governed by the upstream CLA.
 
 ## Security
 
-Security vulnerabilities should be reported following the guidance at [https://aka.ms/SECURITY.md](https://aka.ms/SECURITY.md).
-Please do not report security vulnerabilities through public GitHub issues.
-
-## Trademarks
-
-This project may contain trademarks or logos for projects, products, or services. Authorized use of Microsoft 
-trademarks or logos is subject to and must follow 
-[Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/en-us/legal/intellectualproperty/trademarks/usage/general).
-Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
-Any use of third-party trademarks or logos are subject to those third-party's policies.
-
-## ⭐ Star History
-
-<a href="https://star-history.com/#microsoft/DebugMCP&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=microsoft/DebugMCP&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=microsoft/DebugMCP&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=microsoft/DebugMCP&type=Date" />
- </picture>
-</a>
+See [SECURITY.md](SECURITY.md) for reporting guidance. Do not report security vulnerabilities through public GitHub issues.
 
 ## License
 
-MIT License - See [LICENSE](LICENSE.txt) for details
+MIT License — see [LICENSE.txt](LICENSE.txt) for details.
 
-This extension was created by **Oz Zafar**, **Ori Bar-Ilan** and **Karin Brisker**.
+Based on **DebugMCP**, originally created by **Oz Zafar**, **Ori Bar-Ilan** and **Karin Brisker** (Microsoft). CMSIS/Cortex-M embedded extensions maintained by Matthias Hertel (Arm).

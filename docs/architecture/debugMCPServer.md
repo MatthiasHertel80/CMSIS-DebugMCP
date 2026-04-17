@@ -59,7 +59,7 @@ Each request creates a new `StreamableHTTPServerTransport` instance in stateless
 | Tool | Description |
 |------|-------------|
 | `get_debug_instructions` | Get debugging guide (for clients that don't support resources) |
-| `start_debugging` | Start a debug session |
+| `start_debugging` | Start a debug session (supports `configurationName` passthrough for CMSIS `gdbtarget` configs) |
 | `stop_debugging` | Stop current session |
 | `step_over/into/out` | Stepping commands |
 | `continue_execution` | Continue to next breakpoint |
@@ -68,16 +68,23 @@ Each request creates a new `StreamableHTTPServerTransport` instance in stateless
 | `clear_all_breakpoints` | Remove all breakpoints |
 | `list_breakpoints` | List active breakpoints |
 | `get_variables_values` | Inspect variable values |
-| `evaluate_expression` | Evaluate expressions |
+| `evaluate_expression` | Evaluate expressions (GDB MI via DAP `evaluate` with `context: 'repl'`) |
+| `read_memory` | Read bytes from target memory (DAP `readMemory` + GDB fallbacks) |
+| `read_core_registers` | Read Cortex-M core registers (R0-R15, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK) |
+| `read_peripheral_register` | Read peripheral registers using SVD (Peripheral Inspector API or SVD fallback) |
+| `get_fault_info` | Read and decode CFSR / HFSR / DFSR / MMFAR / BFAR / AFSR |
+| `get_device_info` | Summarize active session — device, probe, processor, GDB server |
 
 ## Exposed Resources
 
 | URI | Content |
 |-----|---------|
-| `debugmcp://docs/debug_instructions` | General debugging guide |
-| `debugmcp://docs/troubleshooting/*` | Language-specific tips |
+| `cmsis-debugmcp://docs/debug_instructions` | General debugging guide |
+| `cmsis-debugmcp://docs/cmsis-embedded-guide` | Cortex-M debugging expertise |
+| `cmsis-debugmcp://docs/troubleshooting/embedded` | Embedded-specific troubleshooting |
+| `cmsis-debugmcp://docs/troubleshooting/*` | Language-specific tips |
 
 ## Configuration
 
-- `debugmcp.serverPort`: Port number (default: 3001)
-- `debugmcp.timeoutInSeconds`: Operation timeout (default: 180)
+- `cmsis-debugmcp.serverPort`: Port number (default: 3001)
+- `cmsis-debugmcp.timeoutInSeconds`: Operation timeout (default: 180)

@@ -5,6 +5,7 @@ import { z } from 'zod';
 import * as path from 'path';
 import * as fs from 'fs';
 import * as http from 'http';
+import express from 'express';
 import {
     DebuggingExecutor,
     ConfigurationManager,
@@ -44,8 +45,8 @@ export class DebugMCPServer {
         }
 
         this.mcpServer = new McpServer({
-            name: 'debugmcp',
-            version: '1.0.0',
+            name: 'cmsis-debugmcp',
+            version: '1.0.9',
         });
 
         this.setupTools();
@@ -77,9 +78,9 @@ export class DebugMCPServer {
                 '\n• Functions return incorrect results' +
                 '\n• Code behaves differently than expected' +
                 '\n• User reports "it doesn\'t work"' +
-                '\n\n⚠️ CRITICAL: Before using this tool, first call get_debug_instructions or read debugmcp://docs/debug_instructions resource!',
+                '\n\n⚠️ CRITICAL: Before using this tool, first call get_debug_instructions or read cmsis-debugmcp://docs/debug_instructions resource!',
             inputSchema: {
-                fileFullPath: z.string().describe('Full path to the source code file to debug'),
+                fileFullPath: z.string().optional().describe('Full path to the source code file to debug. Optional when configurationName is provided (e.g. for embedded/CMSIS gdbtarget configs).'),
                 workingDirectory: z.string().describe('Working directory for the debug session'),
                 testName: z.string().optional().describe(
                     'Name of a specific test name to debug. ' +
@@ -88,10 +89,11 @@ export class DebugMCPServer {
                 ),
                 configurationName: z.string().optional().describe(
                     'Name of a specific debug configuration from launch.json to use. ' +
+                    'For embedded/CMSIS debugging, provide the configuration name (e.g. "CMSIS Debugger: pyOCD"). ' +
                     'Leave empty to be prompted to select a configuration interactively.'
                 ),
             },
-        }, async (args: { fileFullPath: string; workingDirectory: string; testName?: string; configurationName?: string }) => {
+        }, async (args: { fileFullPath?: string; workingDirectory: string; testName?: string; configurationName?: string }) => {
             const result = await this.debuggingHandler.handleStartDebugging(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
@@ -205,6 +207,70 @@ export class DebugMCPServer {
             const result = await this.debuggingHandler.handleEvaluateExpression(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
+
+        // ========== Embedded / Cortex-M Tools ==========
+
+        // Read memory tool
+        this.mcpServer!.registerTool('read_memory', {
+            description: 'Read a range of bytes from the target\'s memory. ' +
+                'Use this for inspecting SRAM, Flash, peripheral registers, or the stack. ' +
+                'Returns hex dump and/or ASCII representation.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+            inputSchema: {
+                address: z.string().describe("Memory address as hex string, e.g. '0x20000000'"),
+                length: z.number().int().min(1).max(4096).describe('Number of bytes to read (1-4096)'),
+                format: z.enum(['hex', 'ascii', 'both']).default('both').describe('Output format'),
+            },
+        }, async (args: { address: string; length: number; format?: 'hex' | 'ascii' | 'both' }) => {
+            const result = await this.debuggingHandler.handleReadMemory(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Read core registers tool
+        this.mcpServer!.registerTool('read_core_registers', {
+            description: 'Read Cortex-M core registers: R0-R12, SP, LR, PC, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK. ' +
+                'Essential for analyzing crash state, stack pointers, and processor mode.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+        }, async () => {
+            const result = await this.debuggingHandler.handleReadCoreRegisters();
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Read peripheral register tool
+        this.mcpServer!.registerTool('read_peripheral_register', {
+            description: 'Read named peripheral registers using SVD data from the Peripheral Inspector extension. ' +
+                'Provide a peripheral name (e.g. "GPIOA", "UART0", "SPI1") and optionally a register name. ' +
+                'If the Peripheral Inspector is not available, provides guidance on using read_memory instead.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+            inputSchema: {
+                peripheral: z.string().describe("Peripheral name, e.g. 'GPIOA', 'UART0', 'RCC'"),
+                register: z.string().optional().describe("Register name, e.g. 'ODR', 'CR1'. If omitted, lists all registers in the peripheral."),
+            },
+        }, async (args: { peripheral: string; register?: string }) => {
+            const result = await this.debuggingHandler.handleReadPeripheralRegister(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Get fault info tool
+        this.mcpServer!.registerTool('get_fault_info', {
+            description: 'Read and decode Cortex-M fault status registers (CFSR, HFSR, BFAR, MMFAR, DFSR, AFSR). ' +
+                'Call this when the target hits a HardFault, BusFault, MemManage, or UsageFault. ' +
+                'Returns a human-readable analysis of which fault bits are set and what they mean.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+        }, async () => {
+            const result = await this.debuggingHandler.handleGetFaultInfo();
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Get device info tool
+        this.mcpServer!.registerTool('get_device_info', {
+            description: 'Return information about the connected debug target: session name, debug type, program path, ' +
+                'GDB path, GDB server, port, and CMSIS config details.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+        }, async () => {
+            const result = await this.debuggingHandler.handleGetDeviceInfo();
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
     }
 
     /**
@@ -212,8 +278,8 @@ export class DebugMCPServer {
      */
     private setupResources() {
         // Add MCP resources for debugging documentation
-        this.mcpServer!.registerResource('Debugging Instructions Guide', 'debugmcp://docs/debug_instructions', {
-            description: 'Step-by-step instructions for debugging with DebugMCP',
+        this.mcpServer!.registerResource('Debugging Instructions Guide', 'cmsis-debugmcp://docs/debug_instructions', {
+            description: 'Step-by-step instructions for debugging with CMSIS-DebugMCP',
             mimeType: 'text/markdown',
         }, async (uri: URL) => {
             const content = await this.loadMarkdownFile('agent-resources/debug_instructions.md');
@@ -238,7 +304,7 @@ export class DebugMCPServer {
         languages.forEach(language => {
             this.mcpServer!.registerResource(
                 languageTitles[language],
-                `debugmcp://docs/troubleshooting/${language}`,
+                `cmsis-debugmcp://docs/troubleshooting/${language}`,
                 {
                     description: `Debugging tips specific to ${language}`,
                     mimeType: 'text/markdown',
@@ -255,6 +321,46 @@ export class DebugMCPServer {
                 }
             );
         });
+
+        // Add CMSIS embedded debugging guide resource
+        this.mcpServer!.registerResource(
+            'CMSIS Embedded Debugging Guide',
+            'cmsis-debugmcp://docs/cmsis-embedded-guide',
+            {
+                description: 'Comprehensive guide for debugging Cortex-M embedded targets using CMSIS tools, including fault analysis, peripheral inspection, and memory layout.',
+                mimeType: 'text/markdown',
+            },
+            async (uri: URL) => {
+                const content = await this.loadMarkdownFile('agent-resources/cmsis-embedded-guide.md');
+                return {
+                    contents: [{
+                        uri: uri.href,
+                        mimeType: 'text/markdown',
+                        text: content,
+                    }]
+                };
+            }
+        );
+
+        // Add embedded troubleshooting resource
+        this.mcpServer!.registerResource(
+            'Embedded Debugging Tips',
+            'cmsis-debugmcp://docs/troubleshooting/embedded',
+            {
+                description: 'Troubleshooting tips for embedded Cortex-M debugging, HardFault analysis, and peripheral issues.',
+                mimeType: 'text/markdown',
+            },
+            async (uri: URL) => {
+                const content = await this.loadMarkdownFile('agent-resources/troubleshooting/embedded.md');
+                return {
+                    contents: [{
+                        uri: uri.href,
+                        mimeType: 'text/markdown',
+                        text: content,
+                    }]
+                };
+            }
+        );
     }
 
     /**
@@ -308,22 +414,19 @@ export class DebugMCPServer {
     }
 
     /**
-     * Start the MCP server with SSE transport over HTTP
+     * Start the MCP server with Streamable HTTP transport
      */
     async start(): Promise<void> {
         // First check if server is already running
         const isRunning = await this.isServerRunning();
         if (isRunning) {
-            logger.info(`DebugMCP server is already running on port ${this.port}`);
+            logger.info(`CMSIS-DebugMCP server is already running on port ${this.port}`);
             return;
         }
 
         try {
-            logger.info(`Starting DebugMCP server on port ${this.port}...`);
+            logger.info(`Starting CMSIS-DebugMCP server on port ${this.port}...`);
 
-            // Dynamically import express (ES module)
-            const expressModule = await import('express');
-            const express = expressModule.default;
             const app = express();
 
             // Parse JSON body for incoming requests
@@ -344,6 +447,11 @@ export class DebugMCPServer {
                     logger.info('MCP transport closed');
                 });
 
+                // Close any existing transport before connecting new one.
+                // Protocol.close() clears _transport but preserves _requestHandlers
+                // (tool registrations), so tools survive across reconnections.
+                await this.mcpServer!.close();
+
                 // Connect the MCP server to this transport
                 await this.mcpServer!.connect(transport);
                 
@@ -352,7 +460,6 @@ export class DebugMCPServer {
             });
 
             // Legacy SSE endpoint for backward compatibility
-            // Redirects to the new /mcp endpoint with appropriate headers
             app.get('/sse', async (req: any, res: any) => {
                 res.status(410).json({ 
                     error: 'SSE endpoint deprecated', 
@@ -361,19 +468,13 @@ export class DebugMCPServer {
                 });
             });
 
-            // Start HTTP server
-            await new Promise<void>((resolve, reject) => {
-                this.httpServer = app.listen(this.port, () => {
-                    resolve();
-                });
-                this.httpServer.on('error', reject);
+            this.httpServer = app.listen(this.port, () => {
+                logger.info(`CMSIS-DebugMCP server started successfully on port ${this.port}`);
             });
 
-            logger.info(`DebugMCP server started successfully on port ${this.port}`);
-
         } catch (error) {
-            logger.error(`Failed to start DebugMCP server`, error);
-            throw new Error(`Failed to start DebugMCP server: ${error}`);
+            logger.error(`Failed to start CMSIS-DebugMCP server`, error);
+            throw new Error(`Failed to start CMSIS-DebugMCP server: ${error}`);
         }
     }
 
@@ -393,7 +494,7 @@ export class DebugMCPServer {
             this.httpServer = null;
         }
 
-        logger.info('DebugMCP server stopped');
+        logger.info('CMSIS-DebugMCP server stopped');
     }
 
     /**

@@ -2,11 +2,11 @@
 
 ## Purpose
 
-Handles automatic configuration of AI coding agents (Cline, GitHub Copilot, Cursor) to connect to the DebugMCP server. Provides a seamless onboarding experience.
+Handles automatic configuration of AI coding agents (Cline, GitHub Copilot, Cursor) to connect to the CMSIS-DebugMCP server. Provides a seamless onboarding experience.
 
 ## Motivation
 
-For AI agents to use DebugMCP, they need MCP server configuration in their settings files. Rather than requiring users to manually edit JSON files, this manager auto-configures supported agents with the correct SSE endpoint.
+For AI agents to use CMSIS-DebugMCP, they need MCP server configuration in their settings files. Rather than requiring users to manually edit JSON files, this manager auto-configures supported agents with the correct Streamable HTTP endpoint.
 
 ## Responsibility
 
@@ -38,12 +38,12 @@ Config base paths vary by OS:
 The configuration written to agent settings:
 ```json
 {
-  "debugmcp": {
+  "cmsis-debugmcp": {
     "autoApprove": [],
     "disabled": false,
     "timeout": 180,
-    "type": "sse",
-    "url": "http://localhost:3001/sse"
+    "type": "streamableHttp",
+    "url": "http://localhost:3001/mcp"
   }
 }
 ```
@@ -71,6 +71,6 @@ Uses VS Code's `globalState` to track whether the onboarding popup has been show
 
 ## Commands
 
-- `debugmcp.showAgentSelectionPopup`: Manually trigger agent setup
-- `debugmcp.configureAgents`: Alternative manual configuration
-- `debugmcp.resetPopupState`: Reset for testing (re-shows popup)
+- `cmsis-debugmcp.showAgentSelectionPopup`: Manually trigger agent setup
+- `cmsis-debugmcp.configureAgents`: Alternative manual configuration
+- `cmsis-debugmcp.resetPopupState`: Reset for testing (re-shows popup)
