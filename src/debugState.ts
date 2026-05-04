@@ -8,6 +8,7 @@ export interface StackFrame {
     source?: string;
     line?: number;
     column?: number;
+    frameId?: number;
 }
 
 /**

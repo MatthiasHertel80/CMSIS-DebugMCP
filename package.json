@@ -2,7 +2,7 @@
   "name": "cmsis-debugmcp",
   "displayName": "CMSIS-DebugMCP",
   "description": "AI-driven debugging for Arm Cortex-M targets via the CMSIS Debugger. MCP server with fault analysis, memory inspection, peripheral registers, and core register reads. Fork of microsoft/DebugMCP.",
-  "version": "1.0.9",
+  "version": "1.0.23",
   "publisher": "mather01",
   "author": {
     "name": "Matthias Hertel",
@@ -55,6 +55,12 @@
   ],
   "main": "./out/extension.js",
   "contributes": {
+    "mcpServerDefinitionProviders": [
+      {
+        "id": "cmsis-debugmcp",
+        "label": "CMSIS-DebugMCP"
+      }
+    ],
     "commands": [
       {
         "command": "cmsis-debugmcp.showAgentSelectionPopup",
@@ -82,6 +88,18 @@
           "type": "number",
           "default": 3001,
           "description": "Port number for the CMSIS-DebugMCP server"
+        },
+        "cmsis-debugmcp.dapRequestTimeoutMs": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 500,
+          "description": "Per-request timeout (in milliseconds) for DAP traffic to the debug adapter / hardware probe. If the probe or GDB server stalls, requests will fail with a HardwareTimeoutError instead of hanging the MCP tool call. Increase for slow targets or large memory reads."
+        },
+        "cmsis-debugmcp.memoryReadTimeoutMs": {
+          "type": "number",
+          "default": 30000,
+          "minimum": 1000,
+          "description": "Overall timeout (in milliseconds) for a single read_memory / read_core_registers tool call. Caps the total time spent talking to the hardware, even across many word-level fallback reads."
         }
       }
     }

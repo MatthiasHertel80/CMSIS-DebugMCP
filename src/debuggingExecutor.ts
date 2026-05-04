@@ -2,40 +2,114 @@
 
 import * as vscode from 'vscode';
 import { DebugState, StackFrame } from './debugState';
+import { customRequestWithTimeout, HardwareTimeoutError, withTimeout } from './utils/timeout';
+import { isSessionStopped, getStoppedReason } from './utils/sessionStateTracker';
+import { logger } from './utils/logger';
+
+/**
+ * Per-operation timeouts for hardware-facing requests.
+ * All values are in milliseconds.
+ */
+export interface HardwareTimeouts {
+    /** Timeout for a single DAP request (stackTrace, evaluate, readMemory, ...). */
+    dapRequestMs: number;
+    /** Overall timeout for multi-request hardware reads (readMemory, readCoreRegisters). */
+    memoryReadMs: number;
+}
+
+export const DEFAULT_HARDWARE_TIMEOUTS: HardwareTimeouts = {
+    dapRequestMs: 10000,
+    memoryReadMs: 30000,
+};
 
 /**
  * Interface for debugging execution operations
  */
+/**
+ * Cap a caller-supplied per-call timeout to the global 60 s policy and fall
+ * back to the configured default when no override is provided.
+ */
+const HARD_CALL_CAP_MS = 60_000;
+function capTimeout(override: number | undefined, fallback: number): number {
+    if (override === undefined || override === null) { return fallback; }
+    if (!Number.isFinite(override) || override <= 0) { return fallback; }
+    return Math.min(override, HARD_CALL_CAP_MS);
+}
+
 export interface IDebuggingExecutor {
     startDebugging(workingDirectory: string, config: vscode.DebugConfiguration): Promise<boolean>;
     startDebuggingByName(workingDirectory: string, configurationName: string): Promise<boolean>;
     stopDebugging(session?: vscode.DebugSession): Promise<void>;
-    stepOver(): Promise<void>;
-    stepInto(): Promise<void>;
-    stepOut(): Promise<void>;
-    continue(): Promise<void>;
+    stepOver(timeoutMs?: number): Promise<void>;
+    stepInto(timeoutMs?: number): Promise<void>;
+    stepOut(timeoutMs?: number): Promise<void>;
+    continue(timeoutMs?: number): Promise<void>;
+    pause(timeoutMs?: number): Promise<void>;
     restart(): Promise<void>;
     addBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
     removeBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
     getCurrentDebugState(numNextLines: number): Promise<DebugState>;
-    getVariables(frameId: number, scope?: 'local' | 'global' | 'all'): Promise<any>;
-    evaluateExpression(expression: string, frameId: number): Promise<any>;
+    getVariables(frameId: number, scope?: 'local' | 'global' | 'all', timeoutMs?: number): Promise<any>;
+    evaluateExpression(expression: string, frameId: number, timeoutMs?: number): Promise<any>;
     getBreakpoints(): readonly vscode.Breakpoint[];
     clearAllBreakpoints(): void;
     hasActiveSession(): Promise<boolean>;
     getActiveSession(): vscode.DebugSession | undefined;
-    readMemory(address: string, length: number): Promise<Buffer>;
-    readMemoryWord(address: string): Promise<number>;
-    readCoreRegisters(): Promise<Record<string, string>>;
-    readPeripheralRegister(peripheral: string, register?: string): Promise<string>;
-    getFaultInfo(): Promise<string>;
+    readMemory(address: string, length: number, timeoutMs?: number): Promise<Buffer>;
+    readMemoryWord(address: string, timeoutMs?: number): Promise<number>;
+    readCoreRegisters(timeoutMs?: number): Promise<Record<string, string>>;
+    readPeripheralRegister(peripheral: string, register?: string, timeoutMs?: number): Promise<string>;
+    getFaultInfo(timeoutMs?: number): Promise<string>;
     getDeviceInfo(): Promise<string>;
+    checkTargetConnection(): Promise<string>;
+    hasDebugSession(): boolean;
+    getSessionStatus(): Promise<SessionStatus>;
+    getThreads(timeoutMs?: number): Promise<DapThread[]>;
+    getCallStack(threadId?: number, levels?: number, timeoutMs?: number): Promise<StackFrame[]>;
+    getVariablesForFrame(frameId: number, scope?: 'local' | 'global' | 'all', timeoutMs?: number): Promise<any>;
+}
+
+export interface DapThread {
+    id: number;
+    name: string;
+    topFrame?: StackFrame;
+}
+
+/**
+ * Coarse classification of the debug session, exposed to MCP clients so an
+ * agent can decide whether the session is gone, the target is running, the
+ * target is stopped (and DAP reads will work), or the probe is unresponsive.
+ */
+export type SessionState =
+    | 'no-session'
+    | 'initializing'
+    | 'running'
+    | 'stopped'
+    | 'unresponsive';
+
+export interface SessionStatus {
+    state: SessionState;
+    sessionName: string | null;
+    sessionType: string | null;
+    configurationName: string | null;
+    /** Whether DAP traffic answered within the short probe timeout. */
+    dapResponsive: boolean;
+    /** Round-trip time of the DAP probe in milliseconds, when it succeeded. */
+    dapProbeMs: number | null;
+    /** Optional human-readable detail (e.g. error from the probe). */
+    detail?: string;
 }
 
 /**
  * Responsible for executing VS Code debugging commands and managing debug sessions
  */
 export class DebuggingExecutor implements IDebuggingExecutor {
+
+    private readonly timeouts: HardwareTimeouts;
+
+    constructor(timeouts: Partial<HardwareTimeouts> = {}) {
+        this.timeouts = { ...DEFAULT_HARDWARE_TIMEOUTS, ...timeouts };
+    }
 
     /**
      * Start a debugging session
@@ -92,14 +166,15 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Execute step over command
      */
-    public async stepOver(): Promise<void> {
+    public async stepOver(timeoutMs?: number): Promise<void> {
         const session = vscode.debug.activeDebugSession;
         if (!session) { throw new Error('No active debug session'); }
         try {
             const threadId = this.getActiveThreadId();
-            await session.customRequest('next', { threadId });
-        } catch {
-            // Fallback to UI command
+            await customRequestWithTimeout(session, 'next', { threadId }, capTimeout(timeoutMs, this.timeouts.dapRequestMs));
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
+            // Fallback to UI command for non-timeout failures
             await vscode.commands.executeCommand('workbench.action.debug.stepOver');
         }
     }
@@ -107,13 +182,14 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Execute step into command
      */
-    public async stepInto(): Promise<void> {
+    public async stepInto(timeoutMs?: number): Promise<void> {
         const session = vscode.debug.activeDebugSession;
         if (!session) { throw new Error('No active debug session'); }
         try {
             const threadId = this.getActiveThreadId();
-            await session.customRequest('stepIn', { threadId });
-        } catch {
+            await customRequestWithTimeout(session, 'stepIn', { threadId }, capTimeout(timeoutMs, this.timeouts.dapRequestMs));
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
             await vscode.commands.executeCommand('workbench.action.debug.stepInto');
         }
     }
@@ -121,13 +197,14 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Execute step out command
      */
-    public async stepOut(): Promise<void> {
+    public async stepOut(timeoutMs?: number): Promise<void> {
         const session = vscode.debug.activeDebugSession;
         if (!session) { throw new Error('No active debug session'); }
         try {
             const threadId = this.getActiveThreadId();
-            await session.customRequest('stepOut', { threadId });
-        } catch {
+            await customRequestWithTimeout(session, 'stepOut', { threadId }, capTimeout(timeoutMs, this.timeouts.dapRequestMs));
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
             await vscode.commands.executeCommand('workbench.action.debug.stepOut');
         }
     }
@@ -135,15 +212,33 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Execute continue command
      */
-    public async continue(): Promise<void> {
+    public async continue(timeoutMs?: number): Promise<void> {
         const session = vscode.debug.activeDebugSession;
         if (!session) { throw new Error('No active debug session'); }
         try {
             const threadId = this.getActiveThreadId();
-            await session.customRequest('continue', { threadId });
-        } catch {
-            // Fallback to UI command
+            await customRequestWithTimeout(session, 'continue', { threadId }, capTimeout(timeoutMs, this.timeouts.dapRequestMs));
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
+            // Fallback to UI command for non-timeout failures
             await vscode.commands.executeCommand('workbench.action.debug.continue');
+        }
+    }
+
+    /**
+     * Pause a running target via DAP `pause`. Used to halt the CPU so
+     * inspection tools (variables / memory / registers) become valid.
+     */
+    public async pause(timeoutMs?: number): Promise<void> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) { throw new Error('No active debug session'); }
+        try {
+            const threadId = this.getActiveThreadId();
+            await customRequestWithTimeout(session, 'pause', { threadId }, capTimeout(timeoutMs, this.timeouts.dapRequestMs));
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
+            // Fallback to UI command for non-timeout failures
+            await vscode.commands.executeCommand('workbench.action.debug.pause');
         }
     }
 
@@ -276,11 +371,11 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     private async extractFrameName(session: vscode.DebugSession, frameId: number, state: DebugState): Promise<void> {
         try {
             // Get full stack trace (up to 50 frames)
-            const stackTraceResponse = await session.customRequest('stackTrace', {
+            const stackTraceResponse = await customRequestWithTimeout<any>(session, 'stackTrace', {
                 threadId: state.threadId,
                 startFrame: 0,
                 levels: 50
-            });
+            }, this.timeouts.dapRequestMs);
 
             if (stackTraceResponse?.stackFrames && stackTraceResponse.stackFrames.length > 0) {
                 // Extract frame name from current frame
@@ -308,15 +403,16 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Get variables from the current debug context
      */
-    public async getVariables(frameId: number, scope?: 'local' | 'global' | 'all'): Promise<any> {
+    public async getVariables(frameId: number, scope?: 'local' | 'global' | 'all', timeoutMs?: number): Promise<any> {
         try {
             const activeSession = vscode.debug.activeDebugSession;
             if (!activeSession) {
                 throw new Error('No active debug session');
             }
 
-            const response = await activeSession.customRequest('scopes', { frameId });
-            
+            const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
+            const response = await customRequestWithTimeout<any>(activeSession, 'scopes', { frameId }, dapMs);
+
             if (!response || !response.scopes || response.scopes.length === 0) {
                 return { scopes: [] };
             }
@@ -332,13 +428,13 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             // Get variables for each scope
             for (const scopeItem of filteredScopes) {
                 try {
-                    const variablesResponse = await activeSession.customRequest('variables', {
+                    const variablesResponse = await customRequestWithTimeout<any>(activeSession, 'variables', {
                         variablesReference: scopeItem.variablesReference
-                    });
+                    }, dapMs);
                     scopeItem.variables = variablesResponse.variables || [];
                 } catch (scopeError) {
                     scopeItem.variables = [];
-                    scopeItem.error = scopeError;
+                    scopeItem.error = scopeError instanceof Error ? scopeError.message : String(scopeError);
                 }
             }
 
@@ -351,18 +447,18 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Evaluate an expression in the current debug context
      */
-    public async evaluateExpression(expression: string, frameId: number): Promise<any> {
+    public async evaluateExpression(expression: string, frameId: number, timeoutMs?: number): Promise<any> {
         try {
             const activeSession = vscode.debug.activeDebugSession;
             if (!activeSession) {
                 throw new Error('No active debug session');
             }
 
-            const response = await activeSession.customRequest('evaluate', {
+            const response = await customRequestWithTimeout<any>(activeSession, 'evaluate', {
                 expression: expression,
                 frameId: frameId,
                 context: 'repl'
-            });
+            }, capTimeout(timeoutMs, this.timeouts.dapRequestMs));
 
             return response;
         } catch (error) {
@@ -389,27 +485,159 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     }
 
     /**
-     * Check if there's an active debug session that is ready for debugging operations
+     * Cheapest possible "is the debugger attached?" check — synchronous, no
+     * DAP traffic. Returns true as long as VS Code reports an active debug
+     * session, regardless of whether the target is currently stopped.
+     *
+     * Use this when you only need to know whether a session exists (e.g.
+     * stop_debugging, restart_debugging, status reporting). Use
+     * {@link hasActiveSession} when you also need a stopped stack frame
+     * (e.g. variables, memory, registers, step/continue).
+     */
+    public hasDebugSession(): boolean {
+        return vscode.debug.activeDebugSession !== undefined;
+    }
+
+    /**
+     * Check if there's an active debug session that is ready for debugging operations.
+     *
+     * "Ready" means: VS Code has a session, the DAP probe is responsive, and
+     * a stopped stack frame is available. This is the gate used by tools that
+     * need to inspect target state (variables, memory, registers, step, ...).
+     *
+     * Performs a cheap DAP `threads` probe with a short timeout rather than
+     * issuing a full `stackTrace`. That keeps the gate fast when the probe
+     * is healthy and guarantees we don't hang indefinitely when it is not.
      */
     public async hasActiveSession(): Promise<boolean> {
-        // Quick check first - no session at all
-        if (!vscode.debug.activeDebugSession) {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
             return false;
         }
 
         try {
-            // Get the current debug state and check if it has location information
-            // This is the most reliable way to determine if the debugger is truly ready
-            const debugState = await this.getCurrentDebugState();
-            
-            // A session is ready when it has location info (file name and line number)
-            // This means the debugger has attached and we can see where we are in the code
-            return debugState.sessionActive && debugState.hasLocationInfo();
-        } catch (error) {
-            // Any error means session isn't ready (e.g., Python still initializing)
-            console.log('Session readiness check failed:', error);
+            // Use a short timeout — this is the readiness gate called before
+            // every tool invocation, so it must never block.
+            const probeTimeout = Math.min(this.timeouts.dapRequestMs, 3000);
+            await customRequestWithTimeout(session, 'threads', {}, probeTimeout);
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) {
+                logger.warn('hasActiveSession: threads probe timed out — probe or target may be unresponsive');
+                return false;
+            }
+            // Non-timeout errors: session exists but is not ready yet (e.g. still initializing)
+            logger.debug('hasActiveSession: threads probe failed', err);
             return false;
         }
+
+        // Session answered DAP — now confirm the target is actually paused.
+        // We use the DAP stopped/continued event tracker rather than
+        // `activeStackItem`, because the latter is `undefined` whenever the
+        // CPU is running *and* during the brief race window right after a
+        // stop event before VS Code surfaces the new stack frame.
+        return isSessionStopped(session);
+    }
+
+    /**
+     * Classify the current debug session for status-reporting purposes.
+     * Never throws; intended to be safe to call even when the probe is hung.
+     */
+    public async getSessionStatus(): Promise<SessionStatus> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) {
+            return {
+                state: 'no-session',
+                sessionName: null,
+                sessionType: null,
+                configurationName: null,
+                dapResponsive: false,
+                dapProbeMs: null,
+            };
+        }
+
+        const base = {
+            sessionName: session.name,
+            sessionType: session.type ?? null,
+            configurationName: session.configuration?.name ?? null,
+        };
+
+        const probeTimeout = Math.min(this.timeouts.dapRequestMs, 3000);
+        const start = Date.now();
+        try {
+            await customRequestWithTimeout(session, 'threads', {}, probeTimeout);
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) {
+                return {
+                    ...base,
+                    state: 'unresponsive',
+                    dapResponsive: false,
+                    dapProbeMs: null,
+                    detail: `DAP threads probe timed out after ${probeTimeout}ms — probe/target may be hung.`,
+                };
+            }
+            // Most likely the adapter is still initializing.
+            return {
+                ...base,
+                state: 'initializing',
+                dapResponsive: false,
+                dapProbeMs: null,
+                detail: `DAP threads probe failed: ${err instanceof Error ? err.message : String(err)}`,
+            };
+        }
+
+        const dapProbeMs = Date.now() - start;
+        // Use the DAP event tracker as the authoritative stopped/running
+        // signal — `activeStackItem` is unreliable while the target is
+        // running and during the brief race after a stop event.
+        const stopped = isSessionStopped(session);
+        const reason = stopped ? getStoppedReason(session) : null;
+
+        return {
+            ...base,
+            state: stopped ? 'stopped' : 'running',
+            dapResponsive: true,
+            dapProbeMs,
+            detail: reason ? `Stopped reason: ${reason}` : undefined,
+        };
+    }
+
+    /**
+     * Perform a low-cost connectivity probe against the debug target.
+     * Returns a short, human-readable status string.
+     */
+    public async checkTargetConnection(): Promise<string> {
+        const status = await this.getSessionStatus();
+        const lines: string[] = [];
+
+        if (status.state === 'no-session') {
+            return 'No active debug session.';
+        }
+
+        lines.push(`Session: ${status.sessionName} (type=${status.sessionType ?? 'unknown'})`);
+        if (status.configurationName) {
+            lines.push(`Configuration: ${status.configurationName}`);
+        }
+
+        switch (status.state) {
+            case 'unresponsive':
+                lines.push(`DAP probe: TIMEOUT — probe/target unresponsive`);
+                if (status.detail) { lines.push(status.detail); }
+                break;
+            case 'initializing':
+                lines.push(`DAP probe: FAILED — adapter likely still initializing`);
+                if (status.detail) { lines.push(status.detail); }
+                break;
+            case 'running':
+                lines.push(`DAP probe: OK (${status.dapProbeMs}ms)`);
+                lines.push('Target state: running — DAP reads (memory/registers/variables) will be rejected until the target stops.');
+                break;
+            case 'stopped':
+                lines.push(`DAP probe: OK (${status.dapProbeMs}ms)`);
+                lines.push('Target state: stopped — full inspection is available.');
+                break;
+        }
+
+        return lines.join('\n');
     }
 
     /**
@@ -425,63 +653,73 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Read a range of bytes from target memory.
      * Tries DAP readMemory first, falls back to GDB evaluate.
      */
-    public async readMemory(address: string, length: number): Promise<Buffer> {
+    public async readMemory(address: string, length: number, timeoutMs?: number): Promise<Buffer> {
         const session = vscode.debug.activeDebugSession;
         if (!session) { throw new Error('No active debug session'); }
 
         // Normalize address to ensure 0x prefix
         const addr = address.startsWith('0x') || address.startsWith('0X') ? address : `0x${address}`;
 
-        try {
-            // Try DAP readMemory (supported by CDT GDB Adapter / Memory Inspector)
-            const response = await session.customRequest('readMemory', {
-                memoryReference: addr,
-                count: length,
-            });
-            if (!response.data) {
-                throw new Error(`No data returned for address ${addr} (${response.unreadableBytes ?? length} unreadable bytes)`);
-            }
-            return Buffer.from(response.data, 'base64');
-        } catch (dapError) {
-            // Fallback: use GDB evaluate to read 32-bit words
-            const wordCount = Math.ceil(length / 4);
-            const byteValues: number[] = [];
-            const debugState = await this.getCurrentDebugState(0);
-            const frameOpt: Record<string, number> | undefined = debugState.frameId !== null ? { frameId: debugState.frameId } : undefined;
+        const overallMs = capTimeout(timeoutMs, this.timeouts.memoryReadMs);
+        const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
 
-            for (let w = 0; w < wordCount; w++) {
-                const wordAddr = BigInt(addr) + BigInt(w * 4);
-                const hexAddr = `0x${wordAddr.toString(16)}`;
-                const val = await this.evaluateMemoryWord(session, hexAddr, frameOpt);
-                // Little-endian: push 4 bytes
-                byteValues.push(val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF, (val >>> 24) & 0xFF);
-            }
+        // Cap the total time spent reading memory — bounds the worst-case when
+        // the DAP readMemory fallback loops over many words.
+        return withTimeout('readMemory', overallMs, async () => {
+            try {
+                // Try DAP readMemory (supported by CDT GDB Adapter / Memory Inspector)
+                const response = await customRequestWithTimeout<any>(session, 'readMemory', {
+                    memoryReference: addr,
+                    count: length,
+                }, dapMs);
+                if (!response.data) {
+                    throw new Error(`No data returned for address ${addr} (${response.unreadableBytes ?? length} unreadable bytes)`);
+                }
+                return Buffer.from(response.data, 'base64');
+            } catch (dapError) {
+                if (dapError instanceof HardwareTimeoutError) { throw dapError; }
+                // Fallback: use GDB evaluate to read 32-bit words
+                const wordCount = Math.ceil(length / 4);
+                const byteValues: number[] = [];
+                const debugState = await this.getCurrentDebugState(0);
+                const frameOpt: Record<string, number> | undefined = debugState.frameId !== null ? { frameId: debugState.frameId } : undefined;
 
-            // Trim to requested length
-            return Buffer.from(byteValues.slice(0, length));
-        }
+                for (let w = 0; w < wordCount; w++) {
+                    const wordAddr = BigInt(addr) + BigInt(w * 4);
+                    const hexAddr = `0x${wordAddr.toString(16)}`;
+                    const val = await this.evaluateMemoryWord(session, hexAddr, frameOpt);
+                    // Little-endian: push 4 bytes
+                    byteValues.push(val & 0xFF, (val >> 8) & 0xFF, (val >> 16) & 0xFF, (val >>> 24) & 0xFF);
+                }
+
+                // Trim to requested length
+                return Buffer.from(byteValues.slice(0, length));
+            }
+        });
     }
 
     /**
      * Read a single 32-bit word from target memory (little-endian).
      */
-    public async readMemoryWord(address: string): Promise<number> {
+    public async readMemoryWord(address: string, timeoutMs?: number): Promise<number> {
         const session = vscode.debug.activeDebugSession;
         if (!session) { throw new Error('No active debug session'); }
 
         const addr = address.startsWith('0x') || address.startsWith('0X') ? address : `0x${address}`;
+        const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
 
         try {
-            const response = await session.customRequest('readMemory', {
+            const response = await customRequestWithTimeout<any>(session, 'readMemory', {
                 memoryReference: addr,
                 count: 4,
-            });
+            }, dapMs);
             if (!response.data) {
                 throw new Error('No data returned');
             }
             const buf = Buffer.from(response.data, 'base64');
             return buf.readUInt32LE(0);
-        } catch {
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
             // Fallback: GDB evaluate
             return await this.evaluateMemoryWord(session, addr);
         }
@@ -503,26 +741,27 @@ export class DebuggingExecutor implements IDebuggingExecutor {
 
         // Strategy 1: evaluate expression in watch context
         try {
-            const result = await session.customRequest('evaluate', {
+            const result = await customRequestWithTimeout<any>(session, 'evaluate', {
                 expression: `*(unsigned int*)${hexAddr}`,
                 context: 'watch',
                 ...frameOpt,
-            });
+            }, this.timeouts.dapRequestMs);
             if (result?.result) {
                 const val = this.parseGdbIntResult(result.result);
                 if (val !== null) { return val; }
             }
-        } catch {
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
             // Fall through to next strategy
         }
 
         // Strategy 2: GDB x command via REPL context
         try {
-            const result = await session.customRequest('evaluate', {
+            const result = await customRequestWithTimeout<any>(session, 'evaluate', {
                 expression: `-exec x/1xw ${hexAddr}`,
                 context: 'repl',
                 ...frameOpt,
-            });
+            }, this.timeouts.dapRequestMs);
             if (result?.result) {
                 // GDB x output: "0x20000000:\t0x12345678"
                 const match = result.result.match(/:\s*(0x[0-9a-fA-F]+)/);
@@ -531,17 +770,18 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                     if (!isNaN(val)) { return val; }
                 }
             }
-        } catch {
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
             // Fall through to next strategy
         }
 
         // Strategy 3: evaluate with hex dereference in repl context
         try {
-            const result = await session.customRequest('evaluate', {
+            const result = await customRequestWithTimeout<any>(session, 'evaluate', {
                 expression: `-exec print/x *(unsigned int*)${hexAddr}`,
                 context: 'repl',
                 ...frameOpt,
-            });
+            }, this.timeouts.dapRequestMs);
             if (result?.result) {
                 // GDB print output: "$1 = 0x12345678"
                 const match = result.result.match(/(0x[0-9a-fA-F]+)/);
@@ -550,7 +790,8 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                     if (!isNaN(val)) { return val; }
                 }
             }
-        } catch {
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
             // All strategies failed
         }
 
@@ -573,7 +814,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Read Cortex-M core registers (R0-R15, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK).
      */
-    public async readCoreRegisters(): Promise<Record<string, string>> {
+    public async readCoreRegisters(timeoutMs?: number): Promise<Record<string, string>> {
         const session = vscode.debug.activeDebugSession;
         if (!session) { throw new Error('No active debug session'); }
 
@@ -584,27 +825,39 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         ];
 
         const debugState = await this.getCurrentDebugState(0);
-        const results: Record<string, string> = {};
+        const frameOpt = debugState.frameId !== null ? { frameId: debugState.frameId } : {};
 
-        for (const reg of registerNames) {
-            try {
-                const response = await session.customRequest('evaluate', {
-                    expression: `$${reg}`,
-                    context: 'watch',
-                    ...(debugState.frameId !== null ? { frameId: debugState.frameId } : {}),
-                });
-                results[reg] = response.result;
-            } catch {
-                results[reg] = '<unavailable>';
-            }
-        }
-        return results;
+        const overallMs = capTimeout(timeoutMs, this.timeouts.memoryReadMs);
+        const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
+
+        // Cap the overall time spent reading every register. Fire requests in
+        // parallel so one stalled register does not block the rest, and swallow
+        // per-register timeouts individually so we always return a best-effort
+        // snapshot rather than nothing.
+        return withTimeout('readCoreRegisters', overallMs, async () => {
+            const entries = await Promise.all(registerNames.map(async (reg) => {
+                try {
+                    const response = await customRequestWithTimeout<any>(session, 'evaluate', {
+                        expression: `$${reg}`,
+                        context: 'watch',
+                        ...frameOpt,
+                    }, dapMs);
+                    return [reg, response.result] as const;
+                } catch (err) {
+                    if (err instanceof HardwareTimeoutError) {
+                        return [reg, '<timeout>'] as const;
+                    }
+                    return [reg, '<unavailable>'] as const;
+                }
+            }));
+            return Object.fromEntries(entries);
+        });
     }
 
     /**
      * Read peripheral register(s) using the Peripheral Inspector or memory fallback.
      */
-    public async readPeripheralRegister(peripheral: string, register?: string): Promise<string> {
+    public async readPeripheralRegister(peripheral: string, register?: string, timeoutMs?: number): Promise<string> {
         // Dynamic import to avoid hard dependency at module level
         const { tryReadPeripheralViaExtension, readPeripheralViaMemory } = await import('./core/peripheralReader.js');
 
@@ -614,27 +867,101 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             return piResult;
         }
 
-        // Fallback to memory-based read
+        // Fallback to memory-based read — cap the overall operation so a
+        // peripheral with hundreds of registers cannot run past the global cap.
         const session = vscode.debug.activeDebugSession;
         if (!session) { throw new Error('No active debug session'); }
         const debugState = await this.getCurrentDebugState(0);
-        return readPeripheralViaMemory(session, peripheral, register, debugState.frameId);
+        const overallMs = capTimeout(timeoutMs, this.timeouts.memoryReadMs);
+        return withTimeout('readPeripheralRegister', overallMs, async () =>
+            readPeripheralViaMemory(session, peripheral, register, debugState.frameId)
+        );
     }
 
     /**
      * Read and decode Cortex-M fault status registers.
      */
-    public async getFaultInfo(): Promise<string> {
+    public async getFaultInfo(timeoutMs?: number): Promise<string> {
         const { FAULT_REGISTER_ADDRESSES, decodeFaultRegisters } = await import('./core/faultDecoder.js');
 
-        const CFSR  = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.CFSR);
-        const HFSR  = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.HFSR);
-        const DFSR  = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.DFSR);
-        const MMFAR = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.MMFAR);
-        const BFAR  = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.BFAR);
-        const AFSR  = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.AFSR);
+        // Bound the whole 6-register sweep to the supplied (or default) cap.
+        const overallMs = capTimeout(timeoutMs, this.timeouts.memoryReadMs);
+        return withTimeout('getFaultInfo', overallMs, async () => {
+            const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
+            const CFSR  = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.CFSR, dapMs);
+            const HFSR  = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.HFSR, dapMs);
+            const DFSR  = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.DFSR, dapMs);
+            const MMFAR = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.MMFAR, dapMs);
+            const BFAR  = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.BFAR, dapMs);
+            const AFSR  = await this.readMemoryWord(FAULT_REGISTER_ADDRESSES.AFSR, dapMs);
+            return decodeFaultRegisters({ CFSR, HFSR, DFSR, MMFAR, BFAR, AFSR });
+        });
+    }
 
-        return decodeFaultRegisters({ CFSR, HFSR, DFSR, MMFAR, BFAR, AFSR });
+    /**
+     * List DAP threads. With RTOS-aware GDB servers (pyOCD --rtos, J-Link
+     * RTOS plugins), each task is enumerated as a thread.
+     */
+    public async getThreads(timeoutMs?: number): Promise<DapThread[]> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) { throw new Error('No active debug session'); }
+
+        const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
+        const response = await customRequestWithTimeout<any>(session, 'threads', {}, dapMs);
+        const threads = response?.threads ?? [];
+
+        const results: DapThread[] = await Promise.all(threads.map(async (t: any) => {
+            let topFrame: StackFrame | undefined;
+            try {
+                const st = await customRequestWithTimeout<any>(session, 'stackTrace', {
+                    threadId: t.id, startFrame: 0, levels: 1
+                }, dapMs);
+                const f = st?.stackFrames?.[0];
+                if (f) {
+                    topFrame = {
+                        name: f.name || 'unknown',
+                        source: f.source?.path || f.source?.name || undefined,
+                        line: f.line || undefined,
+                        column: f.column || undefined,
+                    };
+                }
+            } catch {
+                // best effort — leave topFrame undefined
+            }
+            return { id: t.id, name: t.name ?? `thread-${t.id}`, topFrame };
+        }));
+        return results;
+    }
+
+    /**
+     * Get the call stack for a thread (defaults to the active thread).
+     */
+    public async getCallStack(threadId?: number, levels: number = 50, timeoutMs?: number): Promise<StackFrame[]> {
+        const session = vscode.debug.activeDebugSession;
+        if (!session) { throw new Error('No active debug session'); }
+
+        const tid = threadId ?? this.getActiveThreadId();
+        const response = await customRequestWithTimeout<any>(session, 'stackTrace', {
+            threadId: tid, startFrame: 0, levels
+        }, capTimeout(timeoutMs, this.timeouts.dapRequestMs));
+
+        const frames = response?.stackFrames ?? [];
+        return frames.map((f: any) => ({
+            name: f.name || 'unknown',
+            source: f.source?.path || f.source?.name || undefined,
+            line: f.line || undefined,
+            column: f.column || undefined,
+            // Attach frameId via index trick: callers use getVariablesForFrame with the DAP frame id below
+            ...(f.id !== undefined ? { frameId: f.id } : {}),
+        }));
+    }
+
+    /**
+     * Get variables for an explicit frame id (lets callers walk the stack
+     * without changing the editor's active frame).
+     */
+    public async getVariablesForFrame(frameId: number, scope?: 'local' | 'global' | 'all', timeoutMs?: number): Promise<any> {
+        return this.getVariables(frameId, scope, timeoutMs);
     }
 
     /**

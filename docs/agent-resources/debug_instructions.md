@@ -1,11 +1,72 @@
 # CMSIS-DebugMCP - Debugging Instructions Guide
 
 ⚠️  **CRITICAL INSTRUCTIONS - FOLLOW THESE STEPS:**
-1. **FIRST:** Use 'add_breakpoint' to set an initial breakpoint at a starting point
-2. **THEN:** Optionally use 'add_breakpoint' to set breakpoints at strategic points
-3. **THEN:** Use 'start_debugging' tool to start debugging
-4. **THEN:** Use repetitively all the other tools to navigate and inspect step by step
-5. **FINALLY:** Get to the problematic line to fully understand the root cause. If needed, restart the debug session using restart_debugging.
+0. **FIRST OF ALL:** Establish target awareness — read the project's CMSIS YAMLs and `launch.json` (see "PHASE 0" below). Without this you will guess at addresses, peripheral names and the wrong launch configuration.
+1. **THEN:** Call `get_session_status` to check whether a debug session is already running. Branch on the result (see "PHASE 1" below) — never blindly call `start_debugging`, it will refuse if a session is already active.
+2. **THEN:** Use `add_breakpoint` to set an initial breakpoint at a starting point.
+3. **THEN:** Optionally use `add_breakpoint` to set breakpoints at strategic points.
+4. **THEN:** Bring up the target only when `get_session_status` returned `no-session`:
+   - **CMSIS / Cortex-M solutions:** use `cmsis_action` with `action="load_and_debug"`. This is the same flow as clicking the **Debug** button in the CMSIS Solution panel — it builds (if needed), flashes the device, and attaches the debugger using the configuration the user picked in **Manage Solution → Debugger**. **Do not use `start_debugging` for CMSIS projects** — it bypasses the flash step and uses whichever debug-tab config happens to be selected.
+   - **Non-CMSIS projects** (Python, Java, JS/TS, etc.): use `start_debugging` with `configurationName` from `launch.json`.
+   - **Already-flashed CMSIS target, just want to attach:** use `cmsis_action` with `action="attach"` (skips programming).
+5. **THEN:** Use repetitively all the other tools to navigate and inspect step by step.
+6. **FINALLY:** Get to the problematic line to fully understand the root cause. If needed, restart the debug session using `restart_debugging`.
+
+## 🔎 PHASE 1 — SESSION STATUS GATE
+
+Always call `get_session_status` *before* any session-changing tool. The five possible states each have a different correct next action:
+
+| State | What it means | Correct next action |
+|-------|---------------|---------------------|
+| `no-session` | No debug session is attached. | **CMSIS solutions: always use `cmsis_action load_and_debug`** (flashes then attaches via the CMSIS Solution panel — same as clicking the panel's *Debug* button). Use `start_debugging` ONLY for non-CMSIS targets (Python, Java, JS, etc.) or when you specifically need to attach without flashing. |
+| `initializing` | The adapter is starting / flashing. | Wait briefly and call `get_session_status` again — do NOT issue another start. |
+| `stopped` | A session is attached and the target is paused. | Skip `start_debugging` entirely. Use inspection tools (`get_call_stack`, `get_variables_values`, `read_memory`, …) directly, or `continue_execution` to resume. |
+| `running` | A session is attached and the CPU is executing. | Inspection reads will be rejected. Call `pause_execution`, set/hit a breakpoint, or call `stop_debugging` first depending on intent. |
+| `unresponsive` | The probe / GDB server is hung. | Call `check_target_connection` to confirm, then `restart_debugging` or `stop_debugging`. Do NOT issue more inspection calls — they will time out. |
+
+`start_debugging` and `cmsis_action load_and_debug` will refuse with a structured error if a session is already active, naming the existing session and pointing you at `restart_debugging` / `stop_debugging`. Save the round-trip by checking up front.
+
+## 🛰️ PHASE 0 — TARGET AWARENESS (do this *before* any breakpoint or debug call)
+
+Embedded debugging without target context is guesswork. Before issuing any debug command, gather the following from the workspace. After a successful build these files exist; if any are missing, build first (`cmsis_action` with `action='build'`).
+
+### Files to read, in this order
+
+| Step | File pattern (relative to workspace root) | What you learn |
+|------|-------------------------------------------|----------------|
+| 1 | `<name>.csolution.yml` | The top-level solution: which target / build types and contexts exist, packs required, target board. |
+| 2 | `<name>.cbuild-idx.yml` | Index of every built context. Lists `<context>.cbuild.yml` paths and the `<context>.cbuild-run.yml` for each context. **Start here** to find the active build artifacts. |
+| 3 | `out/<context>.cbuild.yml` (or wherever `cbuild-idx.yml` points) | Per-context build details: **device** (e.g. `AlifSemiconductor::AE822F4055U7AE_RTSS_HE`), processor core, **ELF / output paths**, used CMSIS packs, components, source files, defines. |
+| 4 | `out/<context>.cbuild-run.yml` | Debug runtime: GDB server (pyOCD / J-Link), port, programming algorithms, reset / debug sequences, SVD path. This is what the CMSIS Debugger extension hands to the gdbtarget config. |
+| 5 | `.vscode/launch.json` | The actual VS Code debug configurations. Look for `type: gdbtarget` entries — their `name` field is what you pass as `configurationName` to `start_debugging`. Should be auto-generated/refreshed by the user from the **CMSIS Solution → Manage Solution → Debugger** dialog. |
+
+### If `launch.json` is missing or out of date
+
+Ask the user to:
+
+> Open the **CMSIS Solution** panel → **Manage Solution** → **Debugger** tab → select the debug probe / GDB server → **Apply**. This regenerates `.vscode/launch.json` to match the current `cbuild-run.yml`.
+
+You cannot do this for the user — it is a UI-driven step in the CMSIS Solution extension.
+
+### Documentation links from CMSIS packs
+
+Some projects expose **documentation links** in the CMSIS Solution dialog (board datasheets, MCU reference manuals, BSP/DFP READMEs). These come from the installed CMSIS-Packs (DFP, BSP) or external URLs declared in the pack manifest. Before assuming peripheral semantics, addresses, or fault behavior:
+
+- Check the pack documentation surfaced in the CMSIS Solution UI.
+- The SVD shipped with the DFP is the authoritative source for peripheral names and bit fields used by `read_peripheral_register`.
+
+### Cross-check with `get_device_info`
+
+After `start_debugging` (or `cmsis_action load_and_debug`), call `get_device_info` once to confirm the live session matches what the YAMLs said: program path, GDB server, port, `cbuildRunFile` reference. A mismatch means the user picked a different `configurationName` than the one you analysed.
+
+### Quick checklist
+
+- [ ] Found `<name>.cbuild-idx.yml` and identified the active context.
+- [ ] Read the matching `<context>.cbuild.yml` — know the device, core, ELF path.
+- [ ] Read the matching `<context>.cbuild-run.yml` — know the probe, port, SVD.
+- [ ] Confirmed `launch.json` has a `gdbtarget` entry whose name to pass to `start_debugging`.
+- [ ] Skimmed any pack documentation linked from the CMSIS dialog.
+- [ ] (After attaching) `get_device_info` matches expectations.
 
 ## 🚨 ROOT CAUSE ANALYSIS - CRITICAL FRAMEWORK
 

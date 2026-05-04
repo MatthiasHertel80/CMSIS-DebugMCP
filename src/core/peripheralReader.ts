@@ -5,6 +5,14 @@ import {
     loadSvd, findPeripheral, findRegister, listPeripheralNames,
     decodeFields, SvdPeripheral, SvdRegister, SvdDevice
 } from './svdParser.js';
+import { customRequestWithTimeout, HardwareTimeoutError } from '../utils/timeout.js';
+
+/**
+ * Per-DAP-request timeout for peripheral reads. Matches the default
+ * `cmsis-debugmcp.dapRequestTimeoutMs` setting so a stalled probe cannot
+ * hang peripheral dumps indefinitely.
+ */
+const PERIPHERAL_DAP_TIMEOUT_MS = 10000;
 
 /**
  * Reads peripheral register values.
@@ -235,15 +243,16 @@ async function readWord(
 ): Promise<number> {
     // Try DAP readMemory first
     try {
-        const response = await session.customRequest('readMemory', {
+        const response = await customRequestWithTimeout<any>(session, 'readMemory', {
             memoryReference: hexAddr,
             count: 4,
-        });
+        }, PERIPHERAL_DAP_TIMEOUT_MS);
         if (response?.data) {
             const buf = Buffer.from(response.data, 'base64');
             return buf.readUInt32LE(0);
         }
-    } catch {
+    } catch (err) {
+        if (err instanceof HardwareTimeoutError) { throw err; }
         // Fall through to GDB evaluate
     }
 
@@ -251,26 +260,27 @@ async function readWord(
 
     // Strategy 1: evaluate expression in watch context
     try {
-        const result = await session.customRequest('evaluate', {
+        const result = await customRequestWithTimeout<any>(session, 'evaluate', {
             expression: `*(unsigned int*)${hexAddr}`,
             context: 'watch',
             ...frameOpt,
-        });
+        }, PERIPHERAL_DAP_TIMEOUT_MS);
         if (result?.result) {
             const val = parseGdbInt(result.result);
             if (val !== null) { return val; }
         }
-    } catch {
+    } catch (err) {
+        if (err instanceof HardwareTimeoutError) { throw err; }
         // Fall through
     }
 
     // Strategy 2: GDB x command via REPL context
     try {
-        const result = await session.customRequest('evaluate', {
+        const result = await customRequestWithTimeout<any>(session, 'evaluate', {
             expression: `-exec x/1xw ${hexAddr}`,
             context: 'repl',
             ...frameOpt,
-        });
+        }, PERIPHERAL_DAP_TIMEOUT_MS);
         if (result?.result) {
             const match = result.result.match(/:\s*(0x[0-9a-fA-F]+)/);
             if (match) {
@@ -278,7 +288,8 @@ async function readWord(
                 if (!isNaN(val)) { return val; }
             }
         }
-    } catch {
+    } catch (err) {
+        if (err instanceof HardwareTimeoutError) { throw err; }
         // Fall through
     }
 
