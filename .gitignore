@@ -410,6 +410,10 @@ FodyWeavers.xsd
 # Built Visual Studio Code Extensions
 *.vsix
 
+# Real-board test driver: local configs and per-run reports
+test/realboard/realboard.config.json
+test/realboard/realboard.report.*.json
+
 # Windows Installer files from build outputs
 *.cab
 *.msi

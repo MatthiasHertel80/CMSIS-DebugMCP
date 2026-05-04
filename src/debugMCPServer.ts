@@ -12,6 +12,7 @@ import {
     DebuggingHandler,
     IDebuggingHandler
 } from '.';
+import { HardwareTimeouts } from './debuggingExecutor';
 import { logger } from './utils/logger';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -21,45 +22,55 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
  * Uses the official @modelcontextprotocol/sdk with SSE transport over express.
  */
 export class DebugMCPServer {
-    private mcpServer: McpServer | null = null;
+    // No longer a singleton — a fresh McpServer is created per HTTP request
+    // so concurrent tool calls don't trample each other's transport.
     private httpServer: http.Server | null = null;
     private port: number;
+    private actualPort: number | null = null;
     private initialized: boolean = false;
     private debuggingHandler: IDebuggingHandler;
     private transports: Map<string, StreamableHTTPServerTransport> = new Map();
 
-    constructor(port: number, timeoutInSeconds: number) {
+    constructor(port: number, timeoutInSeconds: number, hardwareTimeouts?: Partial<HardwareTimeouts>) {
         // Initialize the debugging components with dependency injection
-        const executor = new DebuggingExecutor();
+        const executor = new DebuggingExecutor(hardwareTimeouts);
         const configManager = new ConfigurationManager();
         this.debuggingHandler = new DebuggingHandler(executor, configManager, timeoutInSeconds);
         this.port = port;
     }
 
     /**
-     * Initialize the MCP server
+     * Initialize the MCP server. With per-request McpServer instances, this
+     * just flips the initialized flag — no shared server is constructed.
      */
     async initialize() {
-        if (this.initialized) {
-            return;
-        }
-
-        this.mcpServer = new McpServer({
-            name: 'cmsis-debugmcp',
-            version: '1.0.9',
-        });
-
-        this.setupTools();
-        this.setupResources();
         this.initialized = true;
+    }
+
+    /**
+     * Build a fresh McpServer for a single HTTP request and register every
+     * tool + resource on it. Per-request instances mean concurrent tool
+     * calls cannot trample each other's transport (the bug that caused
+     * `get_threads` to hang after the third call).
+     */
+    private createMcpServer(): McpServer {
+        const mcpServer = new McpServer({
+            name: 'cmsis-debugmcp',
+            version: '1.0.23',
+        });
+        this.setupTools(mcpServer);
+        this.setupResources(mcpServer);
+        return mcpServer;
     }
 
     /**
      * Setup MCP tools that delegate to the debugging handler
      */
-    private setupTools() {
+    private setupTools(mcpServer: McpServer) {
+        const TIMEOUT_DESC = 'Optional per-call timeout in milliseconds (capped to 60 000). Overrides the default for this single tool call. Use it when you can estimate the work and want a tighter or looser bound.';
+
         // Get debug instructions tool (for clients that don't support MCP resources like GitHub Copilot)
-        this.mcpServer!.registerTool('get_debug_instructions', {
+        mcpServer.registerTool('get_debug_instructions', {
             description: 'Get the debugging guide with step-by-step instructions for effective debugging. ' +
                 'Returns comprehensive guidance including breakpoint strategies, root cause analysis framework, ' +
                 'and best practices. Call this before starting a debug session.',
@@ -69,16 +80,20 @@ export class DebugMCPServer {
         });
 
         // Start debugging tool
-        this.mcpServer!.registerTool('start_debugging', {
-            description: 'IMPORTANT DEBUGGING TOOL - Start a debug session for a code file' +
-                '\n\nUSE THIS WHEN:' +
-                '\n• Any bug, error, or unexpected behavior occurs' +
-                '\n• Asked to debug a unit test' +
-                '\n• Variables have wrong/null values' +
-                '\n• Functions return incorrect results' +
-                '\n• Code behaves differently than expected' +
-                '\n• User reports "it doesn\'t work"' +
-                '\n\n⚠️ CRITICAL: Before using this tool, first call get_debug_instructions or read cmsis-debugmcp://docs/debug_instructions resource!',
+        mcpServer.registerTool('start_debugging', {
+            description: 'Start a debug session via the standard VS Code debug pipeline (uses launch.json + the debug tab).' +
+                '\n\n⚠️ FOR CMSIS / CORTEX-M PROJECTS: prefer `cmsis_action` with `action="load_and_debug"` ' +
+                '(same as clicking *Debug* in the CMSIS Solution panel — builds if needed, flashes, then attaches). ' +
+                '`start_debugging` skips the flash step and is the wrong tool for embedded targets that need ' +
+                'fresh firmware on the chip.' +
+                '\n\nUSE start_debugging FOR:' +
+                '\n• Non-CMSIS projects (Python, Java, JavaScript/TypeScript, C#, Go, Rust, …)' +
+                '\n• Attaching to an already-flashed CMSIS target where you specifically do NOT want to ' +
+                'reprogram (use `cmsis_action attach` instead if you want the CMSIS panel\'s attach behavior)' +
+                '\n\nUSE THIS WHEN debugging a code-side bug (wrong values, null/undefined, unexpected behavior, ' +
+                'failing tests).' +
+                '\n\n⚠️ CRITICAL: Before using this tool, first call get_debug_instructions or read ' +
+                'cmsis-debugmcp://docs/debug_instructions resource!',
             inputSchema: {
                 fileFullPath: z.string().optional().describe('Full path to the source code file to debug. Optional when configurationName is provided (e.g. for embedded/CMSIS gdbtarget configs).'),
                 workingDirectory: z.string().describe('Working directory for the debug session'),
@@ -92,14 +107,15 @@ export class DebugMCPServer {
                     'For embedded/CMSIS debugging, provide the configuration name (e.g. "CMSIS Debugger: pyOCD"). ' +
                     'Leave empty to be prompted to select a configuration interactively.'
                 ),
+                timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
-        }, async (args: { fileFullPath?: string; workingDirectory: string; testName?: string; configurationName?: string }) => {
+        }, async (args: { fileFullPath?: string; workingDirectory: string; testName?: string; configurationName?: string; timeoutMs?: number }) => {
             const result = await this.debuggingHandler.handleStartDebugging(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Stop debugging tool
-        this.mcpServer!.registerTool('stop_debugging', {
+        mcpServer.registerTool('stop_debugging', {
             description: 'Stop the current debug session',
         }, async () => {
             const result = await this.debuggingHandler.handleStopDebugging();
@@ -107,47 +123,63 @@ export class DebugMCPServer {
         });
 
         // Step over tool
-        this.mcpServer!.registerTool('step_over', {
+        mcpServer.registerTool('step_over', {
             description: 'Execute the current line of code without diving into it.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleStepOver();
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleStepOver(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Step into tool
-        this.mcpServer!.registerTool('step_into', {
+        mcpServer.registerTool('step_into', {
             description: 'Dive into the current line of code.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleStepInto();
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleStepInto(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Step out tool
-        this.mcpServer!.registerTool('step_out', {
+        mcpServer.registerTool('step_out', {
             description: 'Step out of the current function',
-        }, async () => {
-            const result = await this.debuggingHandler.handleStepOut();
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleStepOut(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Pause tool — halts a running target without ending the session.
+        mcpServer.registerTool('pause_execution', {
+            description: 'Pause a running target so inspection tools (variables, memory, registers, ' +
+                'call stack) become valid. No-op if the target is already stopped. Returns the new ' +
+                'debug state on success, or a structured error if the probe is unresponsive.',
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handlePause(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Continue execution tool
-        this.mcpServer!.registerTool('continue_execution', {
+        mcpServer.registerTool('continue_execution', {
             description: 'Resume program execution until the next breakpoint is hit or the program completes.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleContinue();
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleContinue(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Restart debugging tool
-        this.mcpServer!.registerTool('restart_debugging', {
+        mcpServer.registerTool('restart_debugging', {
             description: 'Restart the debug session from the beginning with the same configuration.',
-        }, async () => {
-            const result = await this.debuggingHandler.handleRestart();
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleRestart(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Add breakpoint tool
-        this.mcpServer!.registerTool('add_breakpoint', {
+        mcpServer.registerTool('add_breakpoint', {
             description: 'Set a breakpoint to pause execution at a critical line of code. Essential for debugging: pause before potential errors, examine state at decision points, or verify code paths. Breakpoints let you inspect variables and control flow at exact moments.',
             inputSchema: {
                 fileFullPath: z.string().describe('Full path to the file'),
@@ -159,7 +191,7 @@ export class DebugMCPServer {
         });
 
         // Remove breakpoint tool
-        this.mcpServer!.registerTool('remove_breakpoint', {
+        mcpServer.registerTool('remove_breakpoint', {
             description: 'Remove a breakpoint that is no longer needed.',
             inputSchema: {
                 fileFullPath: z.string().describe('Full path to the file'),
@@ -171,7 +203,7 @@ export class DebugMCPServer {
         });
 
         // Clear all breakpoints tool
-        this.mcpServer!.registerTool('clear_all_breakpoints', {
+        mcpServer.registerTool('clear_all_breakpoints', {
             description: 'Clear all breakpoints at once. Use this after verifying the root cause to clean up before moving on to the next task.',
         }, async () => {
             const result = await this.debuggingHandler.handleClearAllBreakpoints();
@@ -179,7 +211,7 @@ export class DebugMCPServer {
         });
 
         // List breakpoints tool
-        this.mcpServer!.registerTool('list_breakpoints', {
+        mcpServer.registerTool('list_breakpoints', {
             description: 'View all currently set breakpoints across all files.',
         }, async () => {
             const result = await this.debuggingHandler.handleListBreakpoints();
@@ -187,23 +219,25 @@ export class DebugMCPServer {
         });
 
         // Get variables tool
-        this.mcpServer!.registerTool('get_variables_values', {
+        mcpServer.registerTool('get_variables_values', {
             description: 'Inspect all variable values at the current execution point. This is your window into program state - see what data looks like at runtime, verify assumptions, identify unexpected values, and understand why code behaves as it does.',
             inputSchema: {
                 scope: z.enum(['local', 'global', 'all']).optional().describe("Variable scope: 'local', 'global', or 'all'"),
+                timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
-        }, async (args: { scope?: 'local' | 'global' | 'all' }) => {
+        }, async (args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }) => {
             const result = await this.debuggingHandler.handleGetVariables(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Evaluate expression tool
-        this.mcpServer!.registerTool('evaluate_expression', {
+        mcpServer.registerTool('evaluate_expression', {
             description: 'Powerful runtime expression evaluator: Test hypotheses, check computed values, call methods, or inspect object properties in the live debug context. Goes beyond simple variable inspection - evaluate any valid expression in the target language.',
             inputSchema: {
                 expression: z.string().describe('Expression to evaluate in the current programming language context'),
+                timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
-        }, async (args: { expression: string }) => {
+        }, async (args: { expression: string; timeoutMs?: number }) => {
             const result = await this.debuggingHandler.handleEvaluateExpression(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
@@ -211,7 +245,7 @@ export class DebugMCPServer {
         // ========== Embedded / Cortex-M Tools ==========
 
         // Read memory tool
-        this.mcpServer!.registerTool('read_memory', {
+        mcpServer.registerTool('read_memory', {
             description: 'Read a range of bytes from the target\'s memory. ' +
                 'Use this for inspecting SRAM, Flash, peripheral registers, or the stack. ' +
                 'Returns hex dump and/or ASCII representation.',
@@ -220,24 +254,26 @@ export class DebugMCPServer {
                 address: z.string().describe("Memory address as hex string, e.g. '0x20000000'"),
                 length: z.number().int().min(1).max(4096).describe('Number of bytes to read (1-4096)'),
                 format: z.enum(['hex', 'ascii', 'both']).default('both').describe('Output format'),
+                timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
-        }, async (args: { address: string; length: number; format?: 'hex' | 'ascii' | 'both' }) => {
+        }, async (args: { address: string; length: number; format?: 'hex' | 'ascii' | 'both'; timeoutMs?: number }) => {
             const result = await this.debuggingHandler.handleReadMemory(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Read core registers tool
-        this.mcpServer!.registerTool('read_core_registers', {
+        mcpServer.registerTool('read_core_registers', {
             description: 'Read Cortex-M core registers: R0-R12, SP, LR, PC, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK. ' +
                 'Essential for analyzing crash state, stack pointers, and processor mode.',
             annotations: { readOnlyHint: true, destructiveHint: false },
-        }, async () => {
-            const result = await this.debuggingHandler.handleReadCoreRegisters();
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleReadCoreRegisters(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Read peripheral register tool
-        this.mcpServer!.registerTool('read_peripheral_register', {
+        mcpServer.registerTool('read_peripheral_register', {
             description: 'Read named peripheral registers using SVD data from the Peripheral Inspector extension. ' +
                 'Provide a peripheral name (e.g. "GPIOA", "UART0", "SPI1") and optionally a register name. ' +
                 'If the Peripheral Inspector is not available, provides guidance on using read_memory instead.',
@@ -245,25 +281,27 @@ export class DebugMCPServer {
             inputSchema: {
                 peripheral: z.string().describe("Peripheral name, e.g. 'GPIOA', 'UART0', 'RCC'"),
                 register: z.string().optional().describe("Register name, e.g. 'ODR', 'CR1'. If omitted, lists all registers in the peripheral."),
+                timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
-        }, async (args: { peripheral: string; register?: string }) => {
+        }, async (args: { peripheral: string; register?: string; timeoutMs?: number }) => {
             const result = await this.debuggingHandler.handleReadPeripheralRegister(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Get fault info tool
-        this.mcpServer!.registerTool('get_fault_info', {
+        mcpServer.registerTool('get_fault_info', {
             description: 'Read and decode Cortex-M fault status registers (CFSR, HFSR, BFAR, MMFAR, DFSR, AFSR). ' +
                 'Call this when the target hits a HardFault, BusFault, MemManage, or UsageFault. ' +
                 'Returns a human-readable analysis of which fault bits are set and what they mean.',
             annotations: { readOnlyHint: true, destructiveHint: false },
-        }, async () => {
-            const result = await this.debuggingHandler.handleGetFaultInfo();
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleGetFaultInfo(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // Get device info tool
-        this.mcpServer!.registerTool('get_device_info', {
+        mcpServer.registerTool('get_device_info', {
             description: 'Return information about the connected debug target: session name, debug type, program path, ' +
                 'GDB path, GDB server, port, and CMSIS config details.',
             annotations: { readOnlyHint: true, destructiveHint: false },
@@ -271,14 +309,159 @@ export class DebugMCPServer {
             const result = await this.debuggingHandler.handleGetDeviceInfo();
             return { content: [{ type: 'text' as const, text: result }] };
         });
+
+        // Check target connection tool
+        mcpServer.registerTool('check_target_connection', {
+            description: 'Probe the hardware debug connection with a short-timeout DAP ping. ' +
+                'Use this when other tool calls start timing out or returning "unavailable" ' +
+                'to determine whether the probe/GDB server is alive and whether the target ' +
+                'is stopped (so DAP reads are valid). Never hangs — uses an internal short timeout.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+        }, async () => {
+            const result = await this.debuggingHandler.handleCheckTargetConnection();
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Get call stack tool
+        mcpServer.registerTool('get_call_stack', {
+            description: 'Return the full call stack (function names, source, line, frameId) for the active thread, ' +
+                'or a specific thread when threadId is provided. Use the returned frameId values with ' +
+                'get_frame_variables to inspect variables of caller frames without changing the active frame.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+            inputSchema: {
+                threadId: z.number().int().optional().describe('Optional DAP thread id (from get_threads). Defaults to the active thread.'),
+                levels: z.number().int().min(1).max(200).optional().describe('Maximum frames to return (default 50).'),
+                timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
+            },
+        }, async (args: { threadId?: number; levels?: number; timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleGetCallStack(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Get threads / RTOS tasks tool
+        mcpServer.registerTool('get_threads', {
+            description: 'List DAP threads reported by the debug adapter. With an RTOS-aware GDB server ' +
+                '(pyOCD --rtos, J-Link RTOS plugin) each FreeRTOS / RTX / ThreadX task appears as a thread, ' +
+                'matching the xRTOS viewer task list. Returns the thread id, name and top frame; pair with ' +
+                'get_call_stack(threadId=...) to inspect any task\'s call stack.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleGetThreads(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Get frame variables tool
+        mcpServer.registerTool('get_frame_variables', {
+            description: 'Inspect variables of a specific stack frame by its frameId (obtained from get_call_stack). ' +
+                'Lets you walk up the call stack and examine caller-frame state without changing the ' +
+                'editor\'s active frame.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+            inputSchema: {
+                frameId: z.number().int().describe('DAP frame id, as returned by get_call_stack.'),
+                scope: z.enum(['local', 'global', 'all']).optional().describe("Variable scope: 'local', 'global', or 'all'"),
+                timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
+            },
+        }, async (args: { frameId: number; scope?: 'local' | 'global' | 'all'; timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleGetFrameVariables(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // ========== Serial Monitor (UI passthrough) ==========
+        //
+        // Serial RX/TX is owned by the user via the Serial Monitor extension
+        // (ms-vscode.vscode-serial-monitor or eclipse-cdt.serial-monitor).
+        // The MCP server does NOT own its own serial connection — that would
+        // require a native dependency and would conflict with the user's UI
+        // session. The only thing exposed here is "surface the panel".
+
+        mcpServer.registerTool('serial_open_monitor', {
+            description: 'Focus the Microsoft Serial Monitor panel (ms-vscode.vscode-serial-monitor) so ' +
+                'the user can see / drive their existing serial session. The MCP server never owns a ' +
+                'serial connection itself — the user manages port, baud and RX/TX inside the Serial Monitor ' +
+                'UI. This tool only reveals the panel; if the user already has a session running there, ' +
+                'it stays connected. Does NOT open a Terminal-based serial.',
+        }, async () => {
+            // Microsoft Serial Monitor's view container ID is
+            // `vscode-serial-monitor-tools` (panel area). The auto-generated
+            // focus commands are `workbench.view.extension.<containerId>` for
+            // the container and `<viewId>.focus` for individual views.
+            // We deliberately skip eclipse-cdt's `serial-monitor.openSerial`
+            // because that opens a Terminal-based session, not the panel UI.
+            const candidates = [
+                'workbench.view.extension.vscode-serial-monitor-tools',
+                'vscode-serial-monitor.monitor0.focus',
+            ];
+            const tried: string[] = [];
+            for (const cmd of candidates) {
+                try {
+                    await vscode.commands.executeCommand(cmd);
+                    return { content: [{ type: 'text' as const, text:
+                        `Focused the Serial Monitor panel via '${cmd}'. ` +
+                        `If you don't see your session, click the Serial Monitor icon in the panel ` +
+                        `area (ms-vscode.vscode-serial-monitor must be installed; the user must have ` +
+                        `previously opened a session — this tool does not connect a port).`
+                    }] };
+                } catch (err) {
+                    tried.push(`${cmd} (${err instanceof Error ? err.message : String(err)})`);
+                }
+            }
+            return { content: [{ type: 'text' as const, text:
+                `Could not focus the Serial Monitor panel. Tried: ${tried.join('; ')}. ` +
+                `Install ms-vscode.vscode-serial-monitor and open a session manually first.` }] };
+        });
+
+        // CMSIS Solution flash / debug control tool — wraps the CMSIS panel buttons.
+        mcpServer.registerTool('cmsis_action', {
+            description: '⭐ PREFERRED entry point for CMSIS / Cortex-M debugging. Drives the CMSIS Solution ' +
+                'extension — same as clicking the buttons in the CMSIS Solution panel. Operates on the ' +
+                'currently active csolution context (the one selected in the panel).\n\n' +
+                'For embedded debug, ALWAYS choose cmsis_action over start_debugging — start_debugging uses the ' +
+                'plain VS Code debug tab and skips the build / flash pipeline that CMSIS Solution orchestrates.\n\n' +
+                'Actions:\n' +
+                '  • build           — build the active context\n' +
+                '  • load            — flash download to the target\n' +
+                '  • erase           — erase target flash\n' +
+                '  • load_and_run    — flash and run (no debug session)\n' +
+                '  • load_and_debug  — flash and start a debug session (the "Debug" button). Waits for the session to be ready.\n' +
+                '  • attach          — attach debugger to an already-flashed target (skips programming). Waits for the session to be ready.\n' +
+                '  • detach          — detach debugger\n' +
+                '  • stop_run        — stop a previous load_and_run',
+            inputSchema: {
+                action: z.enum([
+                    'build', 'load', 'erase',
+                    'load_and_run', 'load_and_debug',
+                    'attach', 'detach', 'stop_run',
+                ]).describe('Which CMSIS Solution action to invoke'),
+                timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC + ' Applies to the session-readiness wait for load_and_debug / attach.'),
+            },
+        }, async (args: { action: 'build' | 'load' | 'erase' | 'load_and_run' | 'load_and_debug' | 'attach' | 'detach' | 'stop_run'; timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleCmsisCommand(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Get session status tool
+        mcpServer.registerTool('get_session_status', {
+            description: 'Report the current debug-session state in one of five categories: ' +
+                '`no-session`, `initializing`, `running`, `stopped`, or `unresponsive`. ' +
+                'Use this whenever you are unsure whether a session is alive — e.g. after a tool ' +
+                'returned "Debug session is not ready", after a long continue_execution, or after ' +
+                'an apparent timeout. This tool never hangs and never throws: it always returns a ' +
+                'classification plus a hint about what to do next. Prefer this over guessing from ' +
+                'failed tool calls.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+        }, async () => {
+            const result = await this.debuggingHandler.handleGetSessionStatus();
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
     }
 
     /**
      * Setup MCP resources for documentation
      */
-    private setupResources() {
+    private setupResources(mcpServer: McpServer) {
         // Add MCP resources for debugging documentation
-        this.mcpServer!.registerResource('Debugging Instructions Guide', 'cmsis-debugmcp://docs/debug_instructions', {
+        mcpServer.registerResource('Debugging Instructions Guide', 'cmsis-debugmcp://docs/debug_instructions', {
             description: 'Step-by-step instructions for debugging with CMSIS-DebugMCP',
             mimeType: 'text/markdown',
         }, async (uri: URL) => {
@@ -302,7 +485,7 @@ export class DebugMCPServer {
         };
 
         languages.forEach(language => {
-            this.mcpServer!.registerResource(
+            mcpServer.registerResource(
                 languageTitles[language],
                 `cmsis-debugmcp://docs/troubleshooting/${language}`,
                 {
@@ -323,7 +506,7 @@ export class DebugMCPServer {
         });
 
         // Add CMSIS embedded debugging guide resource
-        this.mcpServer!.registerResource(
+        mcpServer.registerResource(
             'CMSIS Embedded Debugging Guide',
             'cmsis-debugmcp://docs/cmsis-embedded-guide',
             {
@@ -343,7 +526,7 @@ export class DebugMCPServer {
         );
 
         // Add embedded troubleshooting resource
-        this.mcpServer!.registerResource(
+        mcpServer.registerResource(
             'Embedded Debugging Tips',
             'cmsis-debugmcp://docs/troubleshooting/embedded',
             {
@@ -417,46 +600,40 @@ export class DebugMCPServer {
      * Start the MCP server with Streamable HTTP transport
      */
     async start(): Promise<void> {
-        // First check if server is already running
-        const isRunning = await this.isServerRunning();
-        if (isRunning) {
-            logger.info(`CMSIS-DebugMCP server is already running on port ${this.port}`);
-            return;
-        }
-
         try {
-            logger.info(`Starting CMSIS-DebugMCP server on port ${this.port}...`);
+            logger.info(`Starting CMSIS-DebugMCP server (preferred port ${this.port})...`);
 
             const app = express();
 
             // Parse JSON body for incoming requests
             app.use(express.json());
 
-            // Streamable HTTP endpoint — handles MCP protocol messages
+            // Streamable HTTP endpoint — handles MCP protocol messages.
+            // Each POST creates its own McpServer + transport pair so
+            // concurrent tool calls cannot trample each other's transport.
             app.post('/mcp', async (req: any, res: any) => {
                 logger.info('New MCP request received');
-                
-                // Create a new transport for each request (stateless mode)
+
+                const perRequestServer = this.createMcpServer();
                 const transport = new StreamableHTTPServerTransport({
-                    sessionIdGenerator: undefined, // Stateless mode - no session management
+                    sessionIdGenerator: undefined, // Stateless mode
                 });
 
-                // Clean up transport when response closes
                 res.on('close', () => {
-                    transport.close();
+                    transport.close().catch(() => { /* ignore */ });
+                    perRequestServer.close().catch(() => { /* ignore */ });
                     logger.info('MCP transport closed');
                 });
 
-                // Close any existing transport before connecting new one.
-                // Protocol.close() clears _transport but preserves _requestHandlers
-                // (tool registrations), so tools survive across reconnections.
-                await this.mcpServer!.close();
-
-                // Connect the MCP server to this transport
-                await this.mcpServer!.connect(transport);
-                
-                // Handle the incoming request
-                await transport.handleRequest(req, res, req.body);
+                try {
+                    await perRequestServer.connect(transport);
+                    await transport.handleRequest(req, res, req.body);
+                } catch (err) {
+                    logger.error('MCP request handling failed', err);
+                    if (!res.headersSent) {
+                        res.status(500).json({ error: String(err) });
+                    }
+                }
             });
 
             // Legacy SSE endpoint for backward compatibility
@@ -468,14 +645,36 @@ export class DebugMCPServer {
                 });
             });
 
-            this.httpServer = app.listen(this.port, () => {
-                logger.info(`CMSIS-DebugMCP server started successfully on port ${this.port}`);
-            });
+            // Try the configured port first; fall back to an OS-assigned port
+            // so multiple IDE windows each get their own server.
+            this.httpServer = await this.listenWithFallback(app, this.port);
+            const addr = this.httpServer.address();
+            this.actualPort = typeof addr === 'object' && addr ? addr.port : this.port;
+            logger.info(`CMSIS-DebugMCP server started successfully on port ${this.actualPort}`);
 
         } catch (error) {
             logger.error(`Failed to start CMSIS-DebugMCP server`, error);
             throw new Error(`Failed to start CMSIS-DebugMCP server: ${error}`);
         }
+    }
+
+    /**
+     * Try to listen on preferredPort. If it is already in use, let the OS
+     * assign a free port (port 0) so multiple IDE instances never collide.
+     */
+    private listenWithFallback(app: ReturnType<typeof express>, preferredPort: number): Promise<http.Server> {
+        return new Promise<http.Server>((resolve, reject) => {
+            const server = app.listen(preferredPort, () => resolve(server));
+            server.on('error', (err: NodeJS.ErrnoException) => {
+                if (err.code === 'EADDRINUSE') {
+                    logger.warn(`Port ${preferredPort} already in use – requesting OS-assigned port`);
+                    const fallback = app.listen(0, () => resolve(fallback));
+                    fallback.on('error', reject);
+                } else {
+                    reject(err);
+                }
+            });
+        });
     }
 
     /**
@@ -485,6 +684,7 @@ export class DebugMCPServer {
         // Note: With stateless StreamableHTTPServerTransport, transports are closed per-request
         // No need to track and close them manually
         this.transports.clear();
+
 
         // Close the HTTP server
         if (this.httpServer) {
@@ -498,10 +698,18 @@ export class DebugMCPServer {
     }
 
     /**
+     * Get the port the server is actually listening on.
+     * May differ from the configured port when the preferred port was busy.
+     */
+    getActualPort(): number {
+        return this.actualPort ?? this.port;
+    }
+
+    /**
      * Get the server endpoint
      */
     getEndpoint(): string {
-        return `http://localhost:${this.port}`;
+        return `http://localhost:${this.getActualPort()}`;
     }
 
     /**

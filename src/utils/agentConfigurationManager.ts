@@ -25,13 +25,21 @@ export class AgentConfigurationManager {
     private context: vscode.ExtensionContext;
     private readonly POPUP_SHOWN_KEY = 'cmsis-debugmcp.popupShown';
     private readonly timeoutInSeconds: number;
-    private readonly serverPort: number;
+    private serverPort: number;
     
 
     constructor(context: vscode.ExtensionContext, timeoutInSeconds: number, serverPort: number) {
         this.context = context;
         this.timeoutInSeconds = timeoutInSeconds;
         this.serverPort = serverPort;
+    }
+
+    /**
+     * Update the server port (e.g. after the OS assigned a free port).
+     * Call this before writing any agent configurations.
+     */
+    public updatePort(port: number): void {
+        this.serverPort = port;
     }
 
     /**
@@ -129,13 +137,10 @@ export class AgentConfigurationManager {
                 configPath: path.join(configBasePath, 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'settings', 'cline_mcp_settings.json'),
                 mcpServerFieldName: 'mcpServers'
             },
-            {
-                id: 'copilot',
-                name: 'copilot',
-                displayName: 'GitHub Copilot',
-                configPath: path.join(configBasePath, 'Code', 'User', 'mcp.json'),
-                mcpServerFieldName: 'servers'
-            },
+            // GitHub Copilot no longer needs a static mcp.json entry.
+            // The extension registers an McpServerDefinitionProvider at
+            // activation time, which eliminates the startup race condition
+            // and handles dynamic port assignment automatically.
             {
                 id: 'cursor',
                 name: 'cursor',
