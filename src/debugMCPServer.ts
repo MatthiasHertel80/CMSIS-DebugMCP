@@ -56,7 +56,7 @@ export class DebugMCPServer {
     private createMcpServer(): McpServer {
         const mcpServer = new McpServer({
             name: 'cmsis-debugmcp',
-            version: '1.0.23',
+            version: '1.0.24',
         });
         this.setupTools(mcpServer);
         this.setupResources(mcpServer);
