@@ -176,6 +176,29 @@ Before stopping your debug session, ensure you can answer:
 - Use conditional breakpoints for loops that iterate many times
 - Set breakpoints before and after critical operations
 
+### ⚠️ Cortex-M hardware breakpoint limit
+
+Cortex-M cores have a small **fixed number of hardware breakpoint comparators** (FPB unit). When the limit is reached, additional breakpoints are silently dropped, fail to bind, or — depending on the GDB stub — make the *whole* set unreliable. **Never set more simultaneous breakpoints than the core supports.**
+
+Typical limits (verify against the device's TRM / cbuild.yml):
+
+| Core              | Comparators (typical) |
+|-------------------|-----------------------|
+| Cortex-M0 / M0+   | 4                     |
+| Cortex-M23        | 4                     |
+| Cortex-M3 / M4    | 6                     |
+| Cortex-M7         | 8                     |
+| Cortex-M33 / M55 / M85 | 8                |
+
+Defensive defaults:
+
+- Treat **4 simultaneous breakpoints** as the safe upper bound unless you have confirmed the core supports more (check `cbuild.yml` for the processor name).
+- Before adding a breakpoint, call `list_breakpoints` to see the current count.
+- When you have to investigate a wider area, work iteratively: set 2–3 well-chosen breakpoints, hit one, learn what you need, remove or replace it before adding the next.
+- After concluding an investigation phase, call `clear_all_breakpoints` to free comparators.
+
+Software breakpoints (which Flash patches without a comparator) are *not* an option on Flash for most Cortex-M targets — only RAM-resident code can use them, which is rarely the case here.
+
 ## Common Patterns:
 ❌ **COMMON MISTAKE:** Starting debugging without breakpoints
 ✅ **BEST PRACTICE:** Always set an initial breakpoint before starting debugging
