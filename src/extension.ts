@@ -68,7 +68,7 @@ export async function activate(context: vscode.ExtensionContext) {
                             'CMSIS-DebugMCP',
                             mcpUri,
                             undefined,
-                            '1.0.27',
+                            '1.0.28',
                         ),
                     ];
                 },
