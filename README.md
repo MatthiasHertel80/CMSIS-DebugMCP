@@ -8,7 +8,7 @@ Works with **GitHub Copilot**, **Cline**, **Cursor**, and any MCP-compatible ass
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.104.0+-blue.svg)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-1.0.9-green.svg)](https://github.com/mather01/DebugMCP)
+[![Version](https://img.shields.io/badge/version-1.0.27-green.svg)](https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases)
 
 <p align="center">
   <img src="assets/DebugMCP.webp" alt="CMSIS-DebugMCP Demo" width="800">
@@ -31,34 +31,59 @@ CMSIS-DebugMCP is an MCP server that gives AI coding agents full control over th
 
 ## Features
 
+> Every hardware-touching tool accepts an optional **`timeoutMs`** parameter (server-capped to 60 000 ms). Handler-level deadlines guarantee no MCP call hangs the agent — see *Operational guarantees* below.
+
+### ⭐ CMSIS Solution control (preferred for embedded)
+
+| Tool | Description | Parameters |
+|------|-------------|------------|
+| **cmsis_action** | Wrap the buttons in the CMSIS Solution panel. ⭐ Preferred entry point for Cortex-M debug — `load_and_debug` builds (if needed), flashes the device, and attaches in one step. | `action` (`build` / `load` / `erase` / `load_and_run` / `load_and_debug` / `attach` / `detach` / `stop_run`)<br>`timeoutMs` (optional) |
+
 ### 🔧 Core Debug Tools
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| **get_debug_instructions** | Get the debugging guide with best practices and workflow instructions | None |
-| **start_debugging** | Start a debug session — pass `configurationName` to launch a `gdbtarget`/CMSIS config from `launch.json` | `configurationName` (optional)<br>`fileFullPath` (optional when `configurationName` is provided)<br>`workingDirectory` (optional)<br>`testName` (optional) |
+| **get_debug_instructions** | Get the debugging guide with best practices, target-awareness checklist, session-status decision table, and root-cause framework | None |
+| **start_debugging** | Start a debug session (non-CMSIS targets — Python/Java/JS/etc.). For CMSIS use `cmsis_action load_and_debug` instead. Refuses if a session is already active. | `configurationName` (optional)<br>`fileFullPath` (optional)<br>`workingDirectory` (optional)<br>`testName` (optional)<br>`timeoutMs` (optional) |
 | **stop_debugging** | Stop the current debug session | None |
-| **step_over** | Execute the next line (step over function calls) | None |
-| **step_into** | Step into function calls | None |
-| **step_out** | Step out of the current function | None |
-| **continue_execution** | Continue until next breakpoint | None |
-| **restart_debugging** | Restart the current debug session | None |
-| **add_breakpoint** | Add a breakpoint at a specific line | `fileFullPath` (required)<br>`lineContent` (required) |
-| **remove_breakpoint** | Remove a breakpoint from a specific line | `fileFullPath` (required)<br>`line` (required) |
-| **clear_all_breakpoints** | Remove all breakpoints at once | None |
-| **list_breakpoints** | List all active breakpoints | None |
-| **get_variables_values** | Get variables and their values at current execution point | `scope` (optional: 'local', 'global', 'all') |
-| **evaluate_expression** | Evaluate an expression in debug context | `expression` (required) |
+| **restart_debugging** | Restart the current debug session and wait for it to become ready | `timeoutMs` (optional) |
+| **pause_execution** | DAP `pause` — halt a running target without ending the session. No-op if already stopped. | `timeoutMs` (optional) |
+| **step_over** / **step_into** / **step_out** | Step. Auto-heals on timeout: pauses the running target, reads PC + frame, reports where the firmware actually was. | `timeoutMs` (optional) |
+| **continue_execution** | Resume execution. Same auto-heal-on-timeout behavior. | `timeoutMs` (optional) |
+| **add_breakpoint** | Add a breakpoint at a specific line. State-aware hint when the session is running. | `fileFullPath`<br>`lineContent` |
+| **remove_breakpoint** | Remove a breakpoint | `fileFullPath`<br>`line` |
+| **clear_all_breakpoints** / **list_breakpoints** | Breakpoint set management | None |
+| **get_variables_values** | Variables at the active frame | `scope` (`local` / `global` / `all`)<br>`timeoutMs` (optional) |
+| **evaluate_expression** | Evaluate an expression in the current frame | `expression`<br>`timeoutMs` (optional) |
+| **get_call_stack** | Full DAP stackTrace with `frameId` per frame | `threadId` (optional)<br>`levels` (optional, ≤200)<br>`timeoutMs` (optional) |
+| **get_threads** | DAP threads enumeration. With RTOS-aware GDB servers (pyOCD `--rtos`, J-Link plugin) returns FreeRTOS / RTX / ThreadX tasks. | `timeoutMs` (optional) |
+| **get_frame_variables** | Inspect variables at an explicit `frameId` without changing the active editor frame | `frameId`<br>`scope` (optional)<br>`timeoutMs` (optional) |
 
 ### 🧠 Embedded / Cortex-M Tools
 
 | Tool | Description | Parameters |
 |------|-------------|------------|
-| **read_memory** | Read a range of bytes from the target | `address` (hex string, e.g. `0x20000000`)<br>`length` (1-4096 bytes)<br>`format` (`hex` / `ascii` / `both`) |
-| **read_core_registers** | Read Cortex-M core registers (R0–R15, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK) | None |
-| **read_peripheral_register** | Read peripheral registers using SVD definitions (via Peripheral Inspector or SVD fallback) | `peripheral` (e.g. `GPIOA`)<br>`register` (optional; omit to list all registers of the peripheral) |
-| **get_fault_info** | Read and decode CFSR / HFSR / DFSR / MMFAR / BFAR / AFSR for HardFault analysis | None |
-| **get_device_info** | Return session info: device, probe, processor, GDB server, ports | None |
+| **read_memory** | Read a range of bytes from the target. DAP `readMemory` with multi-strategy GDB fallback. | `address` (hex)<br>`length` (1-4096)<br>`format` (`hex` / `ascii` / `both`)<br>`timeoutMs` (optional) |
+| **read_core_registers** | Read Cortex-M core registers (R0–R15, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK). Parallel evaluates with overall and per-request deadlines. | `timeoutMs` (optional) |
+| **read_peripheral_register** | Read peripheral registers using SVD definitions (via Peripheral Inspector or SVD fallback) | `peripheral`<br>`register` (optional)<br>`timeoutMs` (optional) |
+| **get_fault_info** | Read and decode CFSR / HFSR / DFSR / MMFAR / BFAR / AFSR for HardFault analysis | `timeoutMs` (optional) |
+| **get_device_info** | Return session info: device, probe, processor, GDB server, ports, cbuild-run reference | None |
+
+### 🩺 Session health
+
+| Tool | Description |
+|------|-------------|
+| **get_session_status** | Never-throwing 5-state classifier (`no-session` / `initializing` / `running` / `stopped` / `unresponsive`) with hint per state |
+| **check_target_connection** | Low-cost DAP `threads` ping with short internal timeout — diagnostic-grade liveness check |
+
+### 📟 Serial (dual backend)
+
+| Tool | Backend | Description |
+|------|---------|-------------|
+| **serial_list_ports** | API → fallback | List ports (MS Serial Monitor API → bundled `serialport`) |
+| **serial_open** / **serial_close** / **serial_write** / **serial_read** (`from='owned'`) / **serial_status** / **serial_clear_buffer** | OWNED | MCP server owns the connection via `serialport`. Use when no MS Serial Monitor session holds the same tty. |
+| **serial_subscribe_monitor** / **serial_unsubscribe_monitor** / **serial_read** (`from='monitor'`) | BRIDGE | Runtime-probe the MS Serial Monitor extension for any of `onDidReceiveData` / `onDataReceived` / `onData` / `onSerialData` / `onDidReadData` / `subscribeData`. Today's API (v0.1.7) only exposes port enumeration; auto-lights-up when MS ships a data event. |
+| **serial_open_monitor** | UI | Focus the Microsoft Serial Monitor panel for the user (does not connect a port). |
 
 ### 📚 MCP Resources
 
@@ -77,25 +102,42 @@ CMSIS-DebugMCP follows systematic debugging practices for effective issue resolu
 - **Follow the Execution Flow**: Use step-by-step execution to understand code flow
 - **Root Cause Analysis**: Don't stop at symptoms - find the underlying cause
 
-### 🛡️ Security & Reliability
-- **Secure Communication**: All MCP communications use secure protocols
-- **Local Operation**: The MCP server runs 100% locally with no external communications and requires no credentials
-- **State Validation**: Robust validation of debugging states and operations
+### 🛡️ Operational guarantees
+
+These are engineering invariants the agent can rely on — see [CHANGES-VS-UPSTREAM.md §5](CHANGES-VS-UPSTREAM.md) for the source-level detail.
+
+- **No MCP tool call exceeds 60 s.** Every hardware-touching handler is wrapped in a handler-level `Promise.race` against a deadline. Server-supplied cap clamps any agent-supplied `timeoutMs` to ≤60 000 ms.
+- **No DAP request hangs the call.** Every `customRequest` goes through `customRequestWithTimeout` and rejects with `HardwareTimeoutError` past its deadline.
+- **Inspection tools never lie about state.** If the target is running, the call returns a state-aware error pointing at the correct recovery tool (`pause_execution` / `add_breakpoint` / `continue_execution`) — not a misleading "no debug session".
+- **Concurrent tool calls don't trample each other.** Per-request `McpServer` + transport pair (matches the official MCP stateless example), eliminating the shared-server race.
+- **Motion timeouts always produce actionable output.** `continue_execution` / `step_*` auto-heal: on overshoot they pause the target, read PC + active frame, and tell you where the firmware actually was.
+- **`start_debugging` / `cmsis_action load_and_debug` refuse duplicates** with a structured message naming the existing session.
+- **Local & credential-free.** The MCP server runs 100% on localhost; nothing leaves the machine.
 
 ## Installation
 
-### From source (VSIX)
+### From the GitHub release (recommended)
+
+Download the latest `cmsis-debugmcp-<version>.vsix` from <https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases>, then:
 
 ```bash
-git clone https://github.com/mather01/DebugMCP.git
-cd DebugMCP
-npm install
-npm run compile
-npx vsce package
-code --install-extension cmsis-debugmcp-1.0.9.vsix
+code --install-extension cmsis-debugmcp-1.0.27.vsix
 ```
 
-The extension activates on startup and registers an MCP server on `http://localhost:3001/mcp` by default.
+Reload the VS Code window after install. Copilot picks the server up automatically via the registered `McpServerDefinitionProvider` — no `mcp.json` edits required.
+
+### From source
+
+```bash
+git clone https://github.com/MatthiasHertel80/CMSIS-DebugMCP.git
+cd CMSIS-DebugMCP
+npm install
+npm run compile
+npx --yes @vscode/vsce package
+code --install-extension cmsis-debugmcp-1.0.27.vsix
+```
+
+The extension activates on startup and registers an MCP server on `http://localhost:3001/mcp` by default (falls back to an OS-assigned port if 3001 is busy — the dynamic discovery handles this for Copilot).
 
 ### Recommended companion extensions
 
