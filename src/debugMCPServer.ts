@@ -1,6 +1,5 @@
 // Copyright (c) Microsoft Corporation.
 
-import * as vscode from 'vscode';
 import { z } from 'zod';
 import * as path from 'path';
 import * as fs from 'fs';
@@ -14,6 +13,7 @@ import {
 } from '.';
 import { HardwareTimeouts } from './debuggingExecutor';
 import { logger } from './utils/logger';
+import { serialHandler } from './serialHandler';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 
@@ -56,7 +56,7 @@ export class DebugMCPServer {
     private createMcpServer(): McpServer {
         const mcpServer = new McpServer({
             name: 'cmsis-debugmcp',
-            version: '1.0.24',
+            version: '1.0.27',
         });
         this.setupTools(mcpServer);
         this.setupResources(mcpServer);
@@ -367,48 +367,128 @@ export class DebugMCPServer {
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
-        // ========== Serial Monitor (UI passthrough) ==========
+        // ========== Serial — dual backend ==========
         //
-        // Serial RX/TX is owned by the user via the Serial Monitor extension
-        // (ms-vscode.vscode-serial-monitor or eclipse-cdt.serial-monitor).
-        // The MCP server does NOT own its own serial connection — that would
-        // require a native dependency and would conflict with the user's UI
-        // session. The only thing exposed here is "surface the panel".
+        // Two backends, one tool surface:
+        //   • OWNED: serialController opens a port via `serialport` (we own it).
+        //   • BRIDGE: serialMonitorBridge taps the MS Serial Monitor extension
+        //     API at runtime — uses whatever the public API exposes today
+        //     (port enum), and auto-lights up data subscription if MS adds it.
+        //
+        // OS reality: only one process can read a tty in non-exclusive mode.
+        // If the user has an MS Serial Monitor session open on the same path,
+        // the OWNED backend will fail to open. Use serial_subscribe_monitor
+        // in that case (zero conflict — taps via API, not the kernel).
+
+        mcpServer.registerTool('serial_list_ports', {
+            description: 'List available serial ports. Tries the MS Serial Monitor API first (friendly names), ' +
+                'falls back to the bundled serialport library.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+        }, async () => {
+            const result = await serialHandler.handleListPorts();
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        mcpServer.registerTool('serial_open', {
+            description: 'Open an OWNED serial port. The MCP server holds the connection and buffers RX. ' +
+                'Use only when no MS Serial Monitor UI session is active on the same path — the OS allows ' +
+                'one reader per tty. Defaults: 115200 baud, 8N1, no flow control.',
+            inputSchema: {
+                path: z.string().describe("Device path, e.g. '/dev/tty.usbmodemABCD' on macOS or 'COM3' on Windows"),
+                baudRate: z.number().int().optional().describe('Baud rate (default 115200)'),
+                dataBits: z.union([z.literal(5), z.literal(6), z.literal(7), z.literal(8)]).optional(),
+                parity: z.enum(['none', 'even', 'odd', 'mark', 'space']).optional(),
+                stopBits: z.union([z.literal(1), z.literal(1.5), z.literal(2)]).optional(),
+                rtscts: z.boolean().optional().describe('RTS/CTS hardware flow control (default false)'),
+            },
+        }, async (args: { path: string; baudRate?: number; dataBits?: 5 | 6 | 7 | 8; parity?: 'none' | 'even' | 'odd' | 'mark' | 'space'; stopBits?: 1 | 1.5 | 2; rtscts?: boolean }) => {
+            const result = await serialHandler.handleOpen(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        mcpServer.registerTool('serial_close', {
+            description: 'Close the OWNED serial port (does not affect the MS Serial Monitor UI).',
+        }, async () => {
+            const result = await serialHandler.handleClose();
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        mcpServer.registerTool('serial_status', {
+            description: 'Report state of both backends: owned port (open / buffer size) and Serial Monitor ' +
+                'bridge (extension installed / activated / data-subscription available / subscribed). ' +
+                'Includes the discovered API keys so you can see what MS exposes in the installed build.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+        }, async () => {
+            const result = await serialHandler.handleStatus();
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        mcpServer.registerTool('serial_write', {
+            description: 'Write to the OWNED serial port. Encoding utf8 (default) or hex.',
+            inputSchema: {
+                data: z.string().describe("Payload. For encoding='hex' use a hex string like '0a 1b 2c'."),
+                encoding: z.enum(['utf8', 'hex']).optional(),
+                appendNewline: z.boolean().optional().describe("Append '\\n' to utf8 payloads (default false)"),
+            },
+        }, async (args: { data: string; encoding?: 'utf8' | 'hex'; appendNewline?: boolean }) => {
+            const result = await serialHandler.handleWrite(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        mcpServer.registerTool('serial_read', {
+            description: 'Read buffered RX bytes from either backend. ' +
+                "Set from='owned' (default) for the MCP-owned port, from='monitor' for bytes captured " +
+                'via the Serial Monitor bridge subscription. consume=true (default) drains the buffer; ' +
+                'consume=false peeks. waitMs blocks up to that many ms when buffer is empty.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+            inputSchema: {
+                maxBytes: z.number().int().min(1).optional(),
+                waitMs: z.number().int().min(0).max(60000).optional(),
+                consume: z.boolean().optional(),
+                format: z.enum(['utf8', 'hex', 'both']).optional(),
+                from: z.enum(['owned', 'monitor']).optional().describe("Backend to read from (default 'owned')"),
+            },
+        }, async (args: { maxBytes?: number; waitMs?: number; consume?: boolean; format?: 'utf8' | 'hex' | 'both'; from?: 'owned' | 'monitor' }) => {
+            const result = await serialHandler.handleRead(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        mcpServer.registerTool('serial_clear_buffer', {
+            description: "Discard buffered RX without reading. from='owned' (default) or 'monitor'.",
+            inputSchema: {
+                from: z.enum(['owned', 'monitor']).optional(),
+            },
+        }, async (args: { from?: 'owned' | 'monitor' }) => {
+            const result = await serialHandler.handleClearBuffer(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        mcpServer.registerTool('serial_subscribe_monitor', {
+            description: 'Subscribe to the MS Serial Monitor extension\'s public data event so the agent can ' +
+                'read bytes the *user\'s* UI session receives — no port fight, no closing the panel. ' +
+                'Probes ext.exports for any of: onDidReceiveData / onDataReceived / onData / onSerialData / ' +
+                'onDidReadData / subscribeData. If the installed Serial Monitor build does not expose a data ' +
+                'event yet, returns a clear error and you should fall back to serial_open (owned port). ' +
+                "After subscribing, read with serial_read from='monitor'.",
+        }, async () => {
+            const result = await serialHandler.handleSubscribeMonitor();
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        mcpServer.registerTool('serial_unsubscribe_monitor', {
+            description: 'Stop the Serial Monitor data subscription (the user\'s UI session is unaffected).',
+        }, async () => {
+            const result = await serialHandler.handleUnsubscribeMonitor();
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
 
         mcpServer.registerTool('serial_open_monitor', {
-            description: 'Focus the Microsoft Serial Monitor panel (ms-vscode.vscode-serial-monitor) so ' +
-                'the user can see / drive their existing serial session. The MCP server never owns a ' +
-                'serial connection itself — the user manages port, baud and RX/TX inside the Serial Monitor ' +
-                'UI. This tool only reveals the panel; if the user already has a session running there, ' +
-                'it stays connected. Does NOT open a Terminal-based serial.',
+            description: 'Focus the Microsoft Serial Monitor panel so the user can see / drive their existing ' +
+                'session. UI-only — does not open or read a port. Pair with serial_subscribe_monitor to also ' +
+                'feed bytes back to the agent.',
         }, async () => {
-            // Microsoft Serial Monitor's view container ID is
-            // `vscode-serial-monitor-tools` (panel area). The auto-generated
-            // focus commands are `workbench.view.extension.<containerId>` for
-            // the container and `<viewId>.focus` for individual views.
-            // We deliberately skip eclipse-cdt's `serial-monitor.openSerial`
-            // because that opens a Terminal-based session, not the panel UI.
-            const candidates = [
-                'workbench.view.extension.vscode-serial-monitor-tools',
-                'vscode-serial-monitor.monitor0.focus',
-            ];
-            const tried: string[] = [];
-            for (const cmd of candidates) {
-                try {
-                    await vscode.commands.executeCommand(cmd);
-                    return { content: [{ type: 'text' as const, text:
-                        `Focused the Serial Monitor panel via '${cmd}'. ` +
-                        `If you don't see your session, click the Serial Monitor icon in the panel ` +
-                        `area (ms-vscode.vscode-serial-monitor must be installed; the user must have ` +
-                        `previously opened a session — this tool does not connect a port).`
-                    }] };
-                } catch (err) {
-                    tried.push(`${cmd} (${err instanceof Error ? err.message : String(err)})`);
-                }
-            }
-            return { content: [{ type: 'text' as const, text:
-                `Could not focus the Serial Monitor panel. Tried: ${tried.join('; ')}. ` +
-                `Install ms-vscode.vscode-serial-monitor and open a session manually first.` }] };
+            const result = await serialHandler.handleOpenInUi();
+            return { content: [{ type: 'text' as const, text: result }] };
         });
 
         // CMSIS Solution flash / debug control tool — wraps the CMSIS panel buttons.
@@ -684,6 +764,16 @@ export class DebugMCPServer {
         // Note: With stateless StreamableHTTPServerTransport, transports are closed per-request
         // No need to track and close them manually
         this.transports.clear();
+
+        // Release any owned serial port and unsubscribe from the Serial Monitor bridge.
+        try {
+            const { serialController } = await import('./core/serialController.js');
+            await serialController.close();
+            const { serialMonitorBridge } = await import('./core/serialMonitorBridge.js');
+            serialMonitorBridge.unsubscribe();
+        } catch (err) {
+            logger.warn(`Failed to clean up serial backends on shutdown: ${err}`);
+        }
 
 
         // Close the HTTP server
