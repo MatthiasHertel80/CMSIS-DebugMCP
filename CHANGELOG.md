@@ -6,6 +6,77 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [1.1.9] - 2026-05-19
+
+### Fixed
+- **`cmsis_action attach` false success — real fix (bug #3, third attempt).** Previous attempts probed `getSessionStatus()`, whose DAP `threads` ping is *answered by the adapter process* even when GDB is not connected to a target — a zombie `gdbtarget` session (adapter alive, no target behind the port) kept its VS Code session object and answered the ping for several seconds, so both probes read a phantom `running`. The decisive signal is now a **non-empty thread list**: a zombie answers `threads` with `[]` (no target → no threads), a real attached Cortex-M always reports ≥1 thread. `confirmSessionSurvives()` now requires `getThreads()` to return ≥1 thread at the decisive (t+6 s) probe; an adapter with a session object but 0 threads is correctly reported as "not connected to a target".
+- **Residual breakpoint-warning noise.** `add_breakpoint` / `clear_all_breakpoints` / `remove_breakpoint` no longer surface the harmless raw adapter error ("Error: could not evaluate expression") in their output. For an `unconfirmed` classification the line now reads `<no echo from adapter — normal>`; `delete`/`clear` only echo the GDB reply when it carries a real message (`Deleted…`, a rejection), staying silent otherwise.
+
+## [1.1.8] - 2026-05-19
+
+### Fixed
+- **False-negative breakpoint warnings.** `add_breakpoint` and `clear_all_breakpoints` printed scary warnings ("⚠️ GDB did not confirm binding", "GDB delete failed") for operations that actually succeeded. Two causes: (1) the DAP `evaluate` of an `-exec break`/`delete` is not a reliable success signal — the `gdbtarget` adapter runs the command (breakpoint binds / delete happens) but frequently returns an empty or error `evaluate` response because it has no scalar result to hand back; (2) `clear`/`clearAll` issued the evaluate with no `frameId`, which the adapter rejects ("Evaluation of expression without frameId is not supported") even though the command still ran. Fixes: a shared `execGdbCommand()` helper now always supplies a `frameId` and never throws on an evaluate error; replies are classified `bound` / `rejected` / `unconfirmed`, and only a *definite* GDB rejection ("No source file", "No symbol", …) produces a warning. A missing echo is reported neutrally — "set; verify with continue_execution" — not as a failure.
+
+## [1.1.7] - 2026-05-19
+
+### Fixed
+- **`cmsis_action attach` false "up and stable" (bug #3, second attempt).** The v1.1.6 fix probed `getSessionStatus()` once after a 3 s wait — but a `gdbtarget` session with no GDB server behind the port keeps its *adapter process* alive answering a shallow DAP `threads` ping for a few seconds before collapsing, so a single probe still caught it in the alive window and the "and stable" wording then positively asserted a stability that was false. Now `confirmSessionSurvives()` probes at **two** time points (t+3 s and t+6 s); each requires the session object to still exist *and* `getSessionStatus()` to be `running`/`stopped`. A no-target session has collapsed to `no-session` by the second probe, so it is correctly reported as "did not survive the initial connect", with guidance to start a GDB server or use `load_and_debug`.
+
+## [1.1.6] - 2026-05-19
+
+Fixes from the v1.1.5 full-tool-surface test report (27/30 tools passing).
+
+### Fixed
+- **Breakpoints now actually bind on the target (bug #1, the priority).** `add_breakpoint` populated VS Code's breakpoint *model* via `vscode.debug.addBreakpoints()`, but on `gdbtarget` sessions the resulting `setBreakpoints` DAP request was not reliably forwarded to the adapter — the target ran straight through. `add_breakpoint` now *also* binds GDB-native via `-exec break file:line` (exactly what a raw GDB session does, which was verified to work), and reports GDB's confirmation (`Breakpoint N at 0x…`). `remove_breakpoint` issues `-exec clear file:line`; `clear_all_breakpoints` issues `-exec delete`. The VS Code model is still updated so `list_breakpoints` and the editor gutter stay in sync.
+- **`cmsis_action attach` no longer reports premature success (bug #3).** A session object appearing is not proof the session is alive — when no GDB server is behind the port, `attach` produced a session that collapsed within seconds. After the session appears, the handler now waits 3 s and re-probes; it reports success only if the session is still `running`/`stopped`, otherwise it reports the collapse and tells the agent to start a GDB server / use `load_and_debug`.
+- **`start_debugging` "launch.json does not exist for passed workspace folder".** That error is thrown by VS Code core when the passed workspace folder doesn't resolve. `startDebuggingByName` now uses a robust `resolveWorkspaceFolder()` — exact API lookup → trailing-slash-normalised path-prefix match (both directions) → the sole workspace folder when there is only one — and, if nothing matches, returns a clear message listing the open workspace folders instead of letting VS Code throw the opaque core error.
+
+### Known / not yet fixed
+- `cmsis_action load_and_debug` builds + flashes but on some projects does not chain into a tracked debug session (no gdbserver/gdb spawned). Workaround: run an external GDB server and use `cmsis_action attach`. Under investigation — likely a CMSIS Solution extension launch-config interaction.
+
+## [1.1.5] - 2026-05-18
+
+### Changed
+- **`cmsis_action` now asks the CMSIS Solution extension whether a solution is active**, instead of inferring it. Before firing any action it calls `cmsis-csolution.getSolutionFile` (which returns the extension's internal `_activeSolution` and never throws) — a truthy result means a csolution project is loaded in this VS Code window. If none is active, the tool returns a precise message naming the cause and the fixes, *without* attempting the command. This replaces the earlier guess based on `.vscode/cmsis.json` presence, which was wrong: `cmsis.json` is legitimately empty/absent for single-target solutions, so a csolution project can be perfectly active without it.
+
+## [1.1.4] - 2026-05-18
+
+### Changed
+- **`cmsis_action` "No active solution set" is now an actionable error.** When the CMSIS Solution extension has no active solution context, the tool returns a specific message naming the cause (the VS Code window running this MCP server does not have the project's `*.csolution.yml` open) and the three concrete fixes, instead of the generic "ensure a solution context is active". Includes the `serverVersion` so a stale build is ruled out at the same time.
+
+## [1.1.3] - 2026-05-18
+
+### Changed
+- **`cmsis_action` is now fire-and-return.** It previously blocked the whole tool call until the debug session was fully up — a multi-core flash + attach legitimately takes 20-40 s, so the call felt hung (and could report a misleading 60 s timeout). It now kicks off the CMSIS command, does one short (~8 s) opportunistic wait for a fast bring-up, then returns and tells the agent to poll `get_session_status` — matching how the CMSIS Solution panel's Debug button behaves (returns instantly, progress shown separately). Worst-case tool duration drops from ~60 s to ~12 s.
+
+### Added
+- **`get_session_status` diagnostics line.** Now reports `serverVersion`, `liveSessionsInThisWindow` (count + names), and whether `vscode.debug.activeDebugSession` is set. When state is `no-session` with `liveSessionsInThisWindow=0`, the hint explicitly calls out the two real causes: a stale extension build (reload the window), or the debug session running in a *different* VS Code window than the MCP server (each window has its own extension host — they cannot see each other). This turns a single `get_session_status` call into a definitive diagnosis instead of guesswork.
+
+## [1.1.2] - 2026-05-18
+
+### Fixed
+- **`get_session_status` reported `no-session` while a debugger was visibly running**: the executor read `vscode.debug.activeDebugSession` directly, which only reflects the session the VS Code UI currently has *focused* — it is `undefined` whenever focus is elsewhere, which is routine for `gdbtarget` multi-core launches. The `sessionStateTracker` already saw every session via its `DebugAdapterTrackerFactory`, so it now also maintains a live-session list and exposes `resolveActiveSession()` = `activeDebugSession ?? mostRecentLiveSession`. All 20 `vscode.debug.activeDebugSession` reads in `debuggingExecutor.ts` route through it, so session status, inspection, stepping, and serial cleanup all work regardless of UI focus. (A session in a *different* VS Code window runs in a different extension host and remains genuinely invisible — that is not fixable.)
+
+## [1.1.1] - 2026-05-18
+
+### Fixed
+- **`cmsis_action` could hang Copilot indefinitely**: `handleCmsisCommand` was the one hardware-touching handler never wrapped in `withHandlerTimeout` (it was added in v1.0.23, after the wrap was applied to the other tools). `await vscode.commands.executeCommand('cmsis-csolution.cmsisLoadAndDebug')` blocks until the CMSIS command's handler resolves — if that command surfaces a QuickPick (select context / debugger), the await waits for a UI interaction the agent cannot make, hanging the tool call forever. Now: the handler is wrapped in `withHandlerTimeout`, and the `executeCommand` is raced against an 8 s kick-off deadline — the build/flash continues in the CMSIS extension regardless, and for session-producing actions we poll for the session afterwards.
+- **`cmsis_action load_and_debug` / `attach` falsely reported "no debug session became ready"**: `waitForActiveDebugSession` polled `hasActiveSession()`, which is true only when the target is *stopped*. A `load_and_debug` whose firmware runs free (no `break main`) or an `attach` to a running target left a perfectly healthy session that the poll never accepted → 60 s timeout → misleading error. `waitForActiveDebugSession` now polls `getSessionStatus()` and accepts any responsive state (`stopped` **or** `running`). Also fixes the same false timeout in `start_debugging` and `restart_debugging`.
+
+## [1.1.0] - 2026-05-18
+
+Ports three useful changes from upstream `microsoft/DebugMCP` (commits after the fork point `4422d8c`), adapted for the CMSIS fork.
+
+### Added
+- **Codex agent configuration support** (from upstream `5feecd4`): `AgentConfigurationManager` now writes a `[mcp_servers.cmsis-debugmcp]` block into the Codex `config.toml` (`$CODEX_HOME/config.toml`, default `~/.codex/config.toml`). TOML is upserted in place, preserving the rest of the file. Stale `/sse` endpoints are migrated.
+- **GitHub Copilot CLI support** (from upstream `7cbe4f9`): writes an MCP entry into `$COPILOT_HOME/mcp-config.json` (default `~/.copilot/mcp-config.json`) with `type: 'http'` + `tools: ['*']`, the shape the Copilot CLI expects. (The Copilot *extension* in VS Code is still handled dynamically by the `McpServerDefinitionProvider` — no static config.)
+
+### Fixed
+- **launch.json parsed with `jsonc-parser`** (from upstream `9c422e5`): the previous regex-based comment stripping matched `//` inside string values — e.g. an `https://` URL in a config field — corrupting the JSON and causing parse failures. CMSIS Solution generates `launch.json` with comments, so this was a real bug for the fork. All three parse sites in `debugConfigurationManager.ts` switched to `jsonc.parse`.
+
+### Notes
+- Upstream's `6f7fa56` ("Remove extra checks in hasActiveSession()") was **not** ported — the fork already replaced that gate with a DAP-event tracker + `ensureStoppedSession` + state-aware errors, which is the better fix for embedded targets.
+
 ## [1.0.27] - 2026-05-18
 
 First public release of the fork. Rolls up the work between v1.0.9 (initial CMSIS fork tag) and v1.0.27 into one release. Published as a GitHub release with `cmsis-debugmcp-1.0.27.vsix` attached.

@@ -28,6 +28,18 @@ interface SessionExecState {
 
 const sessionStates = new WeakMap<vscode.DebugSession, SessionExecState>();
 
+/**
+ * Live debug sessions seen by the adapter tracker, most-recently-started last.
+ * `vscode.debug.activeDebugSession` only reflects the session the VS Code UI
+ * currently has focused — it is `undefined` whenever focus is elsewhere, which
+ * is common with `gdbtarget` multi-core launches. This list lets us answer
+ * "is there a debug session at all?" independently of UI focus.
+ *
+ * Note: a debug session in a *different* VS Code window runs in a different
+ * extension host and is genuinely invisible here — that case cannot be fixed.
+ */
+const liveSessions: vscode.DebugSession[] = [];
+
 function getOrInit(session: vscode.DebugSession): SessionExecState {
     let state = sessionStates.get(session);
     if (!state) {
@@ -35,6 +47,48 @@ function getOrInit(session: vscode.DebugSession): SessionExecState {
         sessionStates.set(session, state);
     }
     return state;
+}
+
+function addLiveSession(session: vscode.DebugSession): void {
+    if (!liveSessions.includes(session)) {
+        liveSessions.push(session);
+    }
+}
+
+function removeLiveSession(session: vscode.DebugSession): void {
+    const idx = liveSessions.indexOf(session);
+    if (idx !== -1) {
+        liveSessions.splice(idx, 1);
+    }
+}
+
+/**
+ * The most-recently-started live debug session, or `undefined` if none.
+ * Use as a fallback when `vscode.debug.activeDebugSession` is `undefined`
+ * but a session is in fact running in this window.
+ */
+export function getMostRecentLiveSession(): vscode.DebugSession | undefined {
+    return liveSessions.length > 0 ? liveSessions[liveSessions.length - 1] : undefined;
+}
+
+/** Number of live debug sessions this extension host has seen via the adapter tracker. */
+export function getLiveSessionCount(): number {
+    return liveSessions.length;
+}
+
+/** Names of the live debug sessions, for diagnostics. */
+export function getLiveSessionNames(): string[] {
+    return liveSessions.map(s => s.name);
+}
+
+/**
+ * Resolve "the debug session the agent should operate on": VS Code's focused
+ * session if there is one, otherwise the most-recently-started tracked
+ * session. This is the single source of truth the executor should use
+ * instead of reading `vscode.debug.activeDebugSession` directly.
+ */
+export function resolveActiveSession(): vscode.DebugSession | undefined {
+    return vscode.debug.activeDebugSession ?? getMostRecentLiveSession();
 }
 
 /**
@@ -77,6 +131,7 @@ export function getStoppedReason(session: vscode.DebugSession): string | null {
 export function registerSessionStateTracker(context: vscode.ExtensionContext): void {
     const factory: vscode.DebugAdapterTrackerFactory = {
         createDebugAdapterTracker(session: vscode.DebugSession): vscode.DebugAdapterTracker {
+            addLiveSession(session);
             return {
                 onDidSendMessage(message: any): void {
                     if (message?.type !== 'event') { return; }
@@ -93,10 +148,12 @@ export function registerSessionStateTracker(context: vscode.ExtensionContext): v
                         logger.debug(`[session-tracker] continued on ${session.name}`);
                     } else if (message.event === 'terminated' || message.event === 'exited') {
                         sessionStates.delete(session);
+                        removeLiveSession(session);
                     }
                 },
                 onWillStopSession(): void {
                     sessionStates.delete(session);
+                    removeLiveSession(session);
                 },
                 onError(error: Error): void {
                     logger.debug(`[session-tracker] adapter error on ${session.name}`, error);
@@ -109,5 +166,15 @@ export function registerSessionStateTracker(context: vscode.ExtensionContext): v
     context.subscriptions.push(
         vscode.debug.registerDebugAdapterTrackerFactory('*', factory),
     );
-    logger.info('Session state tracker registered (DAP stopped/continued events)');
+
+    // Belt-and-braces: also drop sessions on the VS Code termination event,
+    // in case the adapter tracker's onWillStopSession did not fire.
+    context.subscriptions.push(
+        vscode.debug.onDidTerminateDebugSession((session) => {
+            sessionStates.delete(session);
+            removeLiveSession(session);
+        }),
+    );
+
+    logger.info('Session state tracker registered (DAP stopped/continued events + live-session list)');
 }

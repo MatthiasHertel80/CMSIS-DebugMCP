@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import { IDebugConfigurationManager } from './utils/debugConfigurationManager';
 import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
-import { HardwareTimeoutError } from './utils/timeout';
+import { HardwareTimeoutError, withTimeout } from './utils/timeout';
 import { logger } from './utils/logger';
 
 const HARD_HANDLER_CAP_MS = 60_000;
@@ -208,13 +208,28 @@ export class DebuggingHandler implements IDebuggingHandler {
     public async handleClearAllBreakpoints(): Promise<string> {
         try {
             const breakpointCount = this.executor.getBreakpoints().length;
-            
-            if (breakpointCount === 0) {
-                return 'No breakpoints to clear';
+
+            // Clear the VS Code model.
+            this.executor.clearAllBreakpoints();
+
+            // Also delete GDB-native breakpoints (those set via `-exec break`)
+            // — otherwise the target keeps stopping at breakpoints the model
+            // no longer lists. The adapter rarely echoes anything useful for
+            // `delete`; a quiet reply is success, not a failure.
+            let gdbNote = '';
+            if (this.executor.hasDebugSession()) {
+                const reply = await this.executor.clearAllBreakpointsViaGdb();
+                // GDB `delete` is silent on success; only echo the reply when
+                // it carries a real GDB message, not a harmless adapter quirk.
+                gdbNote = /Deleted|Breakpoint|No source|No symbol/i.test(reply)
+                    ? `\nGDB \`delete\` issued — ${reply}`
+                    : `\nGDB \`delete\` issued — all GDB-native breakpoints removed.`;
             }
 
-            this.executor.clearAllBreakpoints();
-            return `Successfully cleared ${breakpointCount} breakpoint(s)`;
+            if (breakpointCount === 0 && !gdbNote) {
+                return 'No breakpoints to clear';
+            }
+            return `Cleared ${breakpointCount} breakpoint(s) from the model.${gdbNote}`;
         } catch (error) {
             throw new Error(`Error clearing breakpoints: ${error}`);
         }
@@ -399,53 +414,99 @@ export class DebuggingHandler implements IDebuggingHandler {
     /**
      * Add a breakpoint at specified location
      */
+    /**
+     * Classify the raw text returned by a GDB `break`/`clear`/`delete` issued
+     * through the DAP evaluate REPL. The adapter often returns nothing useful
+     * even when the command succeeded, so:
+     *   - 'bound'       — GDB echoed "Breakpoint N at 0x…": definitely set.
+     *   - 'rejected'    — a definite GDB rejection (bad path / unknown symbol).
+     *   - 'unconfirmed' — empty / generic adapter error: command very likely
+     *                     ran (side effect happened), just no usable echo.
+     * Only 'rejected' warrants a warning.
+     */
+    private static classifyGdbBreakpointReply(raw: string): 'bound' | 'rejected' | 'unconfirmed' {
+        const t = (raw ?? '').trim();
+        if (/Breakpoint\s+\d+\s+at\s+0x/i.test(t) || /Breakpoint\s+\d+\s+at/i.test(t)) {
+            return 'bound';
+        }
+        if (/No source file named|No line\s+\d+\s+in|No symbol|Function\s+"[^"]*"\s+not defined|No such file|cannot be inserted|No default breakpoint address/i.test(t)) {
+            return 'rejected';
+        }
+        return 'unconfirmed';
+    }
+
     public async handleAddBreakpoint(args: { fileFullPath: string; lineContent: string }): Promise<string> {
         const { fileFullPath, lineContent } = args;
 
-        // VS Code's breakpoint API works regardless of session state, but on
-        // embedded targets the actual binding to the GDB stub typically only
-        // succeeds when the target is stopped. Add a hint so the agent can
-        // pause and retry / inspect later if it tried during a free run.
-        let runningHint = '';
-        if (this.executor.hasDebugSession()) {
-            const status = await this.executor.getSessionStatus();
-            if (status.state === 'running' || status.state === 'unresponsive') {
-                runningHint = ` (note: session state is '${status.state}'. The breakpoint was queued, but ` +
-                    `binding to the target typically requires a stopped state — verify with list_breakpoints ` +
-                    `after the next stop, or stop_debugging / pause first if it does not bind.)`;
-            }
-        }
-
         try {
-            // Find the line number containing the line content
+            // Find the line number(s) containing the line content
             const document = await vscode.workspace.openTextDocument(vscode.Uri.file(fileFullPath));
             const text = document.getText();
             const lines = text.split(/\r?\n/);
             const matchingLineNumbers: number[] = [];
-            
+
             for (let i = 0; i < lines.length; i++) {
                 if (lines[i].includes(lineContent)) {
                     matchingLineNumbers.push(i + 1); // Convert to 1-based line numbers
                 }
             }
-            
+
             if (matchingLineNumbers.length === 0) {
                 throw new Error(`Could not find any lines containing: ${lineContent}`);
             }
-            
+
             const uri = vscode.Uri.file(fileFullPath);
-            
-            // Add breakpoints to all matching lines
+
+            // 1) Add to VS Code's breakpoint model — keeps list_breakpoints and
+            //    the editor gutter in sync.
             for (const lineNumber of matchingLineNumbers) {
                 await this.executor.addBreakpoint(uri, lineNumber);
             }
-            
-            if (matchingLineNumbers.length === 1) {
-                return `Breakpoint added at ${fileFullPath}:${matchingLineNumbers[0]}${runningHint}`;
-            } else {
-                const linesList = matchingLineNumbers.join(', ');
-                return `Breakpoints added at ${matchingLineNumbers.length} locations in ${fileFullPath}: lines ${linesList}${runningHint}`;
+
+            // 2) Bind GDB-native via `-exec break`. On gdbtarget sessions the
+            //    VS Code model's setBreakpoints request is not reliably
+            //    forwarded to the adapter, so the model add alone leaves the
+            //    target running straight through. The GDB break makes it bind
+            //    for real — this is what actually stops the CPU.
+            const gdbReplies: string[] = [];
+            let anyRejected = false;
+            let anyConfirmed = false;
+            if (this.executor.hasDebugSession()) {
+                for (const lineNumber of matchingLineNumbers) {
+                    const reply = await this.executor.setBreakpointViaGdb(fileFullPath, lineNumber);
+                    const cls = DebuggingHandler.classifyGdbBreakpointReply(reply);
+                    if (cls === 'rejected') { anyRejected = true; }
+                    if (cls === 'bound') { anyConfirmed = true; }
+                    // Only echo the raw text when it is meaningful (a real
+                    // binding or a real rejection). For 'unconfirmed' the text
+                    // is just a harmless adapter quirk ("could not evaluate
+                    // expression") — don't surface it, it reads like an error.
+                    const shown = cls === 'unconfirmed' ? '<no echo from adapter — normal>' : reply;
+                    gdbReplies.push(`line ${lineNumber}: ${shown} [${cls}]`);
+                }
             }
+
+            const locList = matchingLineNumbers.join(', ');
+            const head = matchingLineNumbers.length === 1
+                ? `Breakpoint added at ${fileFullPath}:${matchingLineNumbers[0]}`
+                : `Breakpoints added at ${matchingLineNumbers.length} locations in ${fileFullPath}: lines ${locList}`;
+
+            if (!this.executor.hasDebugSession()) {
+                return `${head}\n(No debug session yet — added to the breakpoint list. ` +
+                    `It will be GDB-bound when you add it again after the session is up, or re-add after attach.)`;
+            }
+            if (anyRejected) {
+                return `${head}\n⚠️ GDB rejected one or more breakpoints:\n  ${gdbReplies.join('\n  ')}\n` +
+                    `"No source file" / "No line" means the path does not match the ELF's compiled paths — ` +
+                    `try the path as the compiler saw it, or set by function name via evaluate_expression ("-exec break <function>").`;
+            }
+            if (anyConfirmed) {
+                return `${head}\nGDB confirmed binding:\n  ${gdbReplies.join('\n  ')}`;
+            }
+            // No explicit GDB echo — normal for gdbtarget adapters, NOT a failure.
+            return `${head}\nSent to GDB (\`break\`). The adapter did not echo a confirmation — this is ` +
+                `normal for gdbtarget and does NOT mean it failed. The breakpoint is set; verify by running ` +
+                `continue_execution (the target should stop) or list_breakpoints.\n  ${gdbReplies.join('\n  ')}`;
         } catch (error) {
             throw new Error(`Error adding breakpoint: ${error}`);
         }
@@ -473,9 +534,19 @@ export class DebuggingHandler implements IDebuggingHandler {
             if (!existingBreakpoint) {
                 return `No breakpoint found at ${fileFullPath}:${line}`;
             }
-            
+
             await this.executor.removeBreakpoint(uri, line);
-            return `Breakpoint removed from ${fileFullPath}:${line}`;
+
+            // Also clear the GDB-native breakpoint at this file:line. A quiet
+            // adapter reply is success — `clear` rarely echoes anything.
+            let gdbNote = '';
+            if (this.executor.hasDebugSession()) {
+                const reply = await this.executor.clearBreakpointViaGdb(fileFullPath, line);
+                gdbNote = /Deleted|Breakpoint|No source|No symbol/i.test(reply)
+                    ? `\nGDB \`clear ${fileFullPath}:${line}\` issued — ${reply}`
+                    : `\nGDB \`clear ${fileFullPath}:${line}\` issued.`;
+            }
+            return `Breakpoint removed from ${fileFullPath}:${line}${gdbNote}`;
         } catch (error) {
             throw new Error(`Error removing breakpoint: ${error}`);
         }
@@ -611,7 +682,15 @@ export class DebuggingHandler implements IDebuggingHandler {
     }
 
     /**
-     * Wait for debug session to become active using exponential backoff starting from 1 second
+     * Wait for a debug session to come up after start/restart/load_and_debug.
+     *
+     * "Ready" means a live, responsive session — `stopped` OR `running`.
+     * The earlier implementation required `hasActiveSession()`, which is true
+     * only when the target is *stopped*; that wrongly timed out whenever the
+     * firmware ran free (no `break main`) or when attaching to a running
+     * target, reporting "no debug session became ready" for a session that
+     * had in fact come up fine. We now poll `getSessionStatus()` and accept
+     * any responsive state.
      */
     private async waitForActiveDebugSession(overrideMs?: number): Promise<boolean> {
         const baseDelay = 1000; // Start with 1 second
@@ -624,21 +703,22 @@ export class DebuggingHandler implements IDebuggingHandler {
         let attempt = 0;
 
         while (Date.now() - startTime < totalMs) {
-            if (await this.executor.hasActiveSession()) {
-                logger.info('Debug session is now active!');
+            const status = await this.executor.getSessionStatus();
+            if (status.state === 'stopped' || status.state === 'running') {
+                logger.info(`Debug session is now active (state=${status.state})`);
                 return true;
             }
-            
-            logger.info(`[Attempt ${attempt + 1}] Waiting for debug session to become active...`);
+
+            logger.info(`[Attempt ${attempt + 1}] Waiting for debug session to become active (state=${status.state})...`);
 
             // Calculate delay using exponential backoff with jitter
             const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
             const jitteredDelay = delay + Math.random() * 200; // Add up to 200ms jitter
-            
+
             await new Promise(resolve => setTimeout(resolve, jitteredDelay));
             attempt++;
         }
-        
+
         return false; // Timeout reached
     }
 
@@ -1116,54 +1196,214 @@ REQUIRED NEXT STEPS:
     }
 
     /**
+     * Ask the CMSIS Solution extension whether a solution is currently active.
+     * `cmsis-csolution.getSolutionFile` returns the extension's internal
+     * `_activeSolution` and never throws — a truthy result means a csolution
+     * project is loaded in THIS VS Code window. This is the authoritative
+     * check; do not infer it from the presence of `.vscode/cmsis.json`, which
+     * is legitimately empty/absent for single-target solutions.
+     */
+    private async queryActiveCmsisSolution(): Promise<{ active: boolean; describe: string }> {
+        try {
+            const result = await withTimeout(
+                'cmsis getSolutionFile',
+                5_000,
+                Promise.resolve(vscode.commands.executeCommand('cmsis-csolution.getSolutionFile')),
+            );
+            if (!result) {
+                return { active: false, describe: 'none' };
+            }
+            // _activeSolution may be a string path or an object — extract a path best-effort.
+            let path: string | undefined;
+            if (typeof result === 'string') {
+                path = result;
+            } else if (typeof result === 'object') {
+                const r = result as Record<string, any>;
+                path = r.solutionFile ?? r.fsPath ?? r.path ?? r.uri?.fsPath ?? r.uri?.path;
+            }
+            return { active: true, describe: path ?? '<active, path unknown>' };
+        } catch (err) {
+            // Command missing → CMSIS Solution extension not installed/active.
+            return { active: false, describe: `query failed: ${err instanceof Error ? err.message : String(err)}` };
+        }
+    }
+
+    /**
+     * Confirm a freshly-created debug session actually survives — i.e. the
+     * target is genuinely connected, not just that the debug adapter process
+     * is alive. A `gdbtarget` `attach` with no GDB server behind the port
+     * yields a session whose adapter answers a shallow DAP `threads` ping for
+     * a few seconds and then terminates.
+     *
+     * Strategy: probe at two time points ~4 s apart. At each point require
+     * (a) the session object still exists, and (b) `getSessionStatus()` is
+     * `running`/`stopped`. A doomed session has collapsed to `no-session` by
+     * the second probe. We never assert "stable" off a single observation.
+     */
+    private async confirmSessionSurvives(): Promise<{ stable: boolean; detail: string }> {
+        // A zombie gdbtarget session — adapter process alive, GDB NOT connected
+        // to a target — keeps the VS Code session object around for several
+        // seconds and even answers a shallow DAP `threads` ping. But it
+        // answers with an EMPTY thread list, because there is no target. A
+        // real attached Cortex-M session always reports >= 1 thread (at least
+        // the core). So the decisive signal is a non-empty thread list — not
+        // "a session object exists" and not "the adapter answered".
+        const probe = async (label: string): Promise<{ ok: boolean; detail: string }> => {
+            if (!this.executor.hasDebugSession()) {
+                return { ok: false, detail: `${label}: no session object` };
+            }
+            try {
+                const threads = await this.executor.getThreads(5_000);
+                if (threads.length >= 1) {
+                    return { ok: true, detail: `${label}: ${threads.length} thread(s)` };
+                }
+                return { ok: false, detail: `${label}: session object present but 0 threads — adapter is not connected to a target` };
+            } catch (err) {
+                return { ok: false, detail: `${label}: thread probe failed — ${err instanceof Error ? err.message : String(err)}` };
+            }
+        };
+
+        // Let the connect settle, then probe.
+        await new Promise(r => setTimeout(r, 3_000));
+        const first = await probe('t+3s');
+        // Second probe after a gap. The LATER probe is decisive: a real
+        // session is fully connected (threads populated) by t+6s; a zombie is
+        // gone or still thread-less.
+        await new Promise(r => setTimeout(r, 3_000));
+        const second = await probe('t+6s');
+        if (second.ok) {
+            return { stable: true, detail: `${first.detail}, ${second.detail} — target threads present` };
+        }
+        return { stable: false, detail: `${first.detail}, then ${second.detail}` };
+    }
+
+    /**
      * Drive the CMSIS Solution extension's flash / debug commands — the same
      * actions the buttons in the CMSIS Solution panel invoke. They operate on
      * the currently active csolution context (no arguments).
      */
     public async handleCmsisCommand(args: { action: CmsisAction; timeoutMs?: number }): Promise<string> {
-        // Pre-check: refuse to flash+attach on top of an already-active session.
-        if ((args.action === 'load_and_debug' || args.action === 'attach') && this.executor.hasDebugSession()) {
-            const status = await this.executor.getSessionStatus();
-            return `A debug session is already active (name='${status.sessionName ?? '?'}', state=${status.state}). ` +
-                `Refusing to ${args.action}. Use stop_debugging or restart_debugging first, or proceed with inspection.`;
-        }
-
-        const map: Record<CmsisAction, string> = {
-            build:           'cmsis-csolution.build',
-            load:            'cmsis-csolution.cmsisLoad',
-            erase:           'cmsis-csolution.cmsisErase',
-            load_and_run:    'cmsis-csolution.cmsisLoadAndRun',
-            load_and_debug:  'cmsis-csolution.cmsisLoadAndDebug',
-            attach:          'cmsis-csolution.cmsisAttachDebugger',
-            detach:          'cmsis-csolution.cmsisDetachDebugger',
-            stop_run:        'cmsis-csolution.cmsisStopRun',
-        };
-        const cmd = map[args.action];
-        if (!cmd) {
-            throw new Error(`Unknown CMSIS action: ${args.action}`);
-        }
-
-        try {
-            await vscode.commands.executeCommand(cmd);
-        } catch (error) {
-            throw new Error(`CMSIS command '${cmd}' failed: ${error}. ` +
-                `Ensure the CMSIS Solution extension is installed and a solution context is active.`);
-        }
-
-        // For actions that should leave a debug session running, wait until
-        // it is actually usable so the agent does not race on the next call.
-        if (args.action === 'load_and_debug' || args.action === 'attach') {
-            const sessionActive = await this.waitForActiveDebugSession(args.timeoutMs);
-            if (!sessionActive) {
-                const waited = args.timeoutMs ? `${Math.round(Math.min(args.timeoutMs, 60_000) / 1000)}s` : `${this.timeoutInSeconds}s`;
-                return `CMSIS '${args.action}' issued via '${cmd}', but no debug session became ready within ${waited}. ` +
-                    `The flash/connect step may still be in progress — check the CMSIS output channel.`;
+        return withHandlerTimeout('cmsis_action', args.timeoutMs, async () => {
+            // Pre-check: refuse to flash+attach on top of an already-active session.
+            if ((args.action === 'load_and_debug' || args.action === 'attach') && this.executor.hasDebugSession()) {
+                const status = await this.executor.getSessionStatus();
+                return `A debug session is already active (name='${status.sessionName ?? '?'}', state=${status.state}). ` +
+                    `Refusing to ${args.action}. Use stop_debugging or restart_debugging first, or proceed with inspection.`;
             }
-            const state = await this.executor.getCurrentDebugState(this.numNextLines);
-            return `CMSIS '${args.action}' completed. Debug session state: ${state.toString()}`;
-        }
 
-        return `CMSIS '${args.action}' command '${cmd}' executed. Check the CMSIS output channel for build/flash progress.`;
+            // Pre-check: confirm the CMSIS Solution extension actually has an
+            // active solution in this window, by asking the extension itself.
+            const solution = await this.queryActiveCmsisSolution();
+            if (!solution.active) {
+                const diag = this.executor.getDiagnostics();
+                return `CMSIS '${args.action}' not attempted: the CMSIS Solution extension reports no active ` +
+                    `solution in this VS Code window (cmsis-csolution.getSolutionFile → ${solution.describe}). ` +
+                    `cmsis_action operates on whatever solution that extension has active — it cannot select one. ` +
+                    `Fixes: (1) open the folder containing the project's *.csolution.yml in the VS Code window ` +
+                    `running this MCP server (serverVersion=${diag.serverVersion}); (2) in the CMSIS Solution panel, ` +
+                    `confirm a solution + active context is selected; (3) if the solution is open in a different ` +
+                    `window, drive cmsis_action from that window's MCP server.`;
+            }
+
+            const map: Record<CmsisAction, string> = {
+                build:           'cmsis-csolution.build',
+                load:            'cmsis-csolution.cmsisLoad',
+                erase:           'cmsis-csolution.cmsisErase',
+                load_and_run:    'cmsis-csolution.cmsisLoadAndRun',
+                load_and_debug:  'cmsis-csolution.cmsisLoadAndDebug',
+                attach:          'cmsis-csolution.cmsisAttachDebugger',
+                detach:          'cmsis-csolution.cmsisDetachDebugger',
+                stop_run:        'cmsis-csolution.cmsisStopRun',
+            };
+            const cmd = map[args.action];
+            if (!cmd) {
+                throw new Error(`Unknown CMSIS action: ${args.action}`);
+            }
+
+            // FIRE-AND-RETURN model. `cmsis-csolution.*` commands run a long
+            // build/flash/launch pipeline — clicking the panel's Debug button
+            // returns instantly and shows progress separately, and this tool
+            // does the same. We do NOT block the tool call for the 20-40 s a
+            // multi-core flash+attach takes. The command is kicked off and we
+            // do a SHORT opportunistic check; the agent then polls
+            // get_session_status (per the PHASE 1 workflow) to know when the
+            // session is ready. `executeCommand` is not awaited to completion
+            // because a CMSIS QuickPick (select context / debugger) would
+            // otherwise hang the call on a UI interaction the agent can't make.
+            let commandFailed: string | null = null;
+            const commandPromise = (vscode.commands.executeCommand(cmd) as Promise<unknown>)
+                .catch((error) => {
+                    const msg = String(error);
+                    if (/no active solution/i.test(msg)) {
+                        // The CMSIS Solution extension has no solution context.
+                        // It auto-activates a *.csolution.yml only when the
+                        // workspace folder open in this window contains one.
+                        const diag = this.executor.getDiagnostics();
+                        commandFailed =
+                            `CMSIS '${args.action}' failed: no active CMSIS solution. The CMSIS Solution extension ` +
+                            `has no solution context in THIS VS Code window. Fixes:\n` +
+                            `  1. Make sure the VS Code window running this MCP server (serverVersion=${diag.serverVersion}) ` +
+                            `has the project's *.csolution.yml folder open — each window is independent.\n` +
+                            `  2. In that window, open the CMSIS Solution panel and confirm a solution + active context ` +
+                            `is selected (Manage Solution).\n` +
+                            `  3. If the solution is open in a different window, drive cmsis_action from that window's ` +
+                            `MCP server instead.\n` +
+                            `cmsis_action operates on whatever solution the CMSIS Solution extension has active — it ` +
+                            `cannot select one for you.`;
+                    } else {
+                        commandFailed = `CMSIS command '${cmd}' failed: ${error}. ` +
+                            `Ensure the CMSIS Solution extension is installed and a solution context is active.`;
+                    }
+                });
+
+            // Brief kick-off window — long enough to surface an immediate
+            // command error, short enough not to feel like a hang.
+            const kickOffMs = 4_000;
+            await Promise.race([
+                commandPromise,
+                new Promise<void>((resolve) => setTimeout(resolve, kickOffMs)),
+            ]);
+            if (commandFailed) {
+                throw new Error(commandFailed);
+            }
+
+            // For session-producing actions, do ONE short opportunistic wait
+            // (not the full 30-60 s) so a fast bring-up is reported inline,
+            // then hand off to get_session_status polling.
+            if (args.action === 'load_and_debug' || args.action === 'attach') {
+                const opportunisticMs = 8_000;
+                const sessionActive = await this.waitForActiveDebugSession(opportunisticMs);
+                if (sessionActive) {
+                    // A session object appearing is NOT proof the target is
+                    // connected. With no GDB server behind the port, `attach`
+                    // produces a session whose adapter still answers a shallow
+                    // DAP `threads` ping for a few seconds, then collapses.
+                    // Probe at two time points spaced apart — a doomed session
+                    // is gone by the second check.
+                    const survived = await this.confirmSessionSurvives();
+                    if (survived.stable) {
+                        const state = await this.executor.getCurrentDebugState(this.numNextLines);
+                        return `CMSIS '${args.action}' completed — debug session survived the connect ` +
+                            `(${survived.detail}). State: ${state.toString()}`;
+                    }
+                    return `CMSIS '${args.action}' started a debug session but it did NOT survive the initial ` +
+                        `connect — ${survived.detail}. ` +
+                        `For 'attach' this almost always means no GDB server is listening on the configured port: ` +
+                        `start the GDB server first, or use 'load_and_debug' (which launches one). ` +
+                        `Confirm with get_session_status / check_target_connection.`;
+                }
+                return `CMSIS '${args.action}' issued via '${cmd}'. The flash/connect pipeline is running in the ` +
+                    `CMSIS extension (a multi-core flash + attach typically takes 20-40 s). This tool does not ` +
+                    `block for the whole pipeline — poll get_session_status until it reports 'running' or ` +
+                    `'stopped'. If get_session_status keeps reporting 'no-session' with liveSessionsInThisWindow=0, ` +
+                    `the CMSIS panel may be showing a picker the user must resolve, or the debug session is in a ` +
+                    `different VS Code window than this MCP server.`;
+            }
+
+            // build / load / erase / load_and_run / detach / stop_run — no session expected.
+            return `CMSIS '${args.action}' command '${cmd}' issued. It runs in the CMSIS extension — ` +
+                `check the CMSIS output channel for build/flash progress.`;
+        });
     }
 
     public async handleGetSessionStatus(): Promise<string> {
@@ -1176,16 +1416,36 @@ REQUIRED NEXT STEPS:
         lines.push(`DAP responsive: ${status.dapResponsive}${status.dapProbeMs !== null ? ` (probe ${status.dapProbeMs}ms)` : ''}`);
         if (status.detail) { lines.push(`Detail: ${status.detail}`); }
 
+        // Diagnostics — make it possible to tell a stale build / wrong-window
+        // problem apart from a genuine no-session.
+        const diag = this.executor.getDiagnostics();
+        lines.push(
+            `Diagnostics: serverVersion=${diag.serverVersion}, ` +
+            `liveSessionsInThisWindow=${diag.liveSessionCount}` +
+            (diag.liveSessionNames.length > 0 ? ` [${diag.liveSessionNames.join(', ')}]` : '') +
+            `, vscodeActiveDebugSession=${diag.hasVscodeActiveSession ? 'set' : 'undefined'}`
+        );
+
         // Add a hint so the agent knows what it can do next.
         switch (status.state) {
             case 'no-session':
-                lines.push('Hint: call start_debugging to attach.');
+                if (diag.liveSessionCount === 0) {
+                    lines.push(
+                        'Hint: no debug session is visible to THIS extension host. Either no session is ' +
+                        'running, OR the debug session is in a different VS Code window (each window runs ' +
+                        'its own extension host + MCP server — they cannot see each other). Confirm the ' +
+                        'debug session and this MCP server are in the same VS Code window. If you just ' +
+                        'reinstalled the extension, reload the window so the new build is active.'
+                    );
+                } else {
+                    lines.push('Hint: call start_debugging or cmsis_action load_and_debug to attach.');
+                }
                 break;
             case 'initializing':
                 lines.push('Hint: the adapter is still starting — wait a moment and retry.');
                 break;
             case 'running':
-                lines.push('Hint: target is running. Add a breakpoint, then call continue_execution, or call stop_debugging.');
+                lines.push('Hint: target is running. Add a breakpoint then continue_execution, or call pause_execution to inspect now.');
                 break;
             case 'stopped':
                 lines.push('Hint: full inspection (variables, memory, registers) is available.');
