@@ -3,7 +3,10 @@
 import * as vscode from 'vscode';
 import { DebugState, StackFrame } from './debugState';
 import { customRequestWithTimeout, HardwareTimeoutError, withTimeout } from './utils/timeout';
-import { isSessionStopped, getStoppedReason } from './utils/sessionStateTracker';
+import {
+    isSessionStopped, getStoppedReason, resolveActiveSession,
+    getLiveSessionCount, getLiveSessionNames,
+} from './utils/sessionStateTracker';
 import { logger } from './utils/logger';
 
 /**
@@ -48,6 +51,9 @@ export interface IDebuggingExecutor {
     restart(): Promise<void>;
     addBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
     removeBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
+    setBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number): Promise<string>;
+    clearBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number): Promise<string>;
+    clearAllBreakpointsViaGdb(timeoutMs?: number): Promise<string>;
     getCurrentDebugState(numNextLines: number): Promise<DebugState>;
     getVariables(frameId: number, scope?: 'local' | 'global' | 'all', timeoutMs?: number): Promise<any>;
     evaluateExpression(expression: string, frameId: number, timeoutMs?: number): Promise<any>;
@@ -64,6 +70,7 @@ export interface IDebuggingExecutor {
     checkTargetConnection(): Promise<string>;
     hasDebugSession(): boolean;
     getSessionStatus(): Promise<SessionStatus>;
+    getDiagnostics(): ExecutorDiagnostics;
     getThreads(timeoutMs?: number): Promise<DapThread[]>;
     getCallStack(threadId?: number, levels?: number, timeoutMs?: number): Promise<StackFrame[]>;
     getVariablesForFrame(frameId: number, scope?: 'local' | 'global' | 'all', timeoutMs?: number): Promise<any>;
@@ -74,6 +81,17 @@ export interface DapThread {
     name: string;
     topFrame?: StackFrame;
 }
+
+/** Low-level diagnostics for telling a stale build / wrong-window apart from a genuine no-session. */
+export interface ExecutorDiagnostics {
+    serverVersion: string;
+    liveSessionCount: number;
+    liveSessionNames: string[];
+    hasVscodeActiveSession: boolean;
+}
+
+/** Bumped in lockstep with package.json — surfaced by getDiagnostics() so the agent can confirm which build answered. */
+export const SERVER_VERSION = '1.1.9';
 
 /**
  * Coarse classification of the debug session, exposed to MCP clients so an
@@ -142,7 +160,16 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         configurationName: string
     ): Promise<boolean> {
         try {
-            const workspaceFolder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(workingDirectory));
+            const workspaceFolder = this.resolveWorkspaceFolder(workingDirectory);
+            if (!workspaceFolder) {
+                const open = (vscode.workspace.workspaceFolders ?? []).map(f => f.uri.fsPath);
+                throw new Error(
+                    `No VS Code workspace folder matches workingDirectory '${workingDirectory}'. ` +
+                    `Open workspace folders: ${open.length ? open.join(', ') : '(none)'}. ` +
+                    `launch.json is resolved relative to an open workspace folder — open the project folder ` +
+                    `(the one containing .vscode/launch.json) in this VS Code window.`
+                );
+            }
             return await vscode.debug.startDebugging(workspaceFolder, configurationName);
         } catch (error) {
             throw new Error(`Failed to start debugging with configuration '${configurationName}': ${error}`);
@@ -150,11 +177,45 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     }
 
     /**
+     * Robustly map a working-directory path to an open VS Code workspace
+     * folder. `vscode.workspace.getWorkspaceFolder` requires the URI to be
+     * inside a folder and is sensitive to trailing slashes / exact casing, so
+     * a wrong `workingDirectory` argument silently yields `undefined` and VS
+     * Code then throws "launch.json does not exist for passed workspace
+     * folder". This tries, in order: exact API lookup → path-prefix match in
+     * either direction → the sole workspace folder when there is only one.
+     */
+    private resolveWorkspaceFolder(workingDirectory: string): vscode.WorkspaceFolder | undefined {
+        const folders = vscode.workspace.workspaceFolders ?? [];
+        if (folders.length === 0) { return undefined; }
+
+        // 1) Exact VS Code lookup.
+        const direct = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(workingDirectory));
+        if (direct) { return direct; }
+
+        // 2) Path-prefix match, trailing slashes normalised, in both directions
+        //    (workingDirectory may be a parent of, or nested under, a folder).
+        const norm = (p: string) => p.replace(/[/\\]+$/, '');
+        const wd = norm(workingDirectory);
+        for (const f of folders) {
+            const fp = norm(f.uri.fsPath);
+            if (fp === wd || wd.startsWith(fp + '/') || fp.startsWith(wd + '/')) {
+                return f;
+            }
+        }
+
+        // 3) Single-folder workspace — unambiguous, use it.
+        if (folders.length === 1) { return folders[0]; }
+
+        return undefined;
+    }
+
+    /**
      * Stop the debugging session
      */
     public async stopDebugging(session?: vscode.DebugSession): Promise<void> {
         try {
-            const activeSession = session || vscode.debug.activeDebugSession;
+            const activeSession = session || resolveActiveSession();
             if (activeSession) {
                 await vscode.debug.stopDebugging(activeSession);
             }
@@ -167,7 +228,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Execute step over command
      */
     public async stepOver(timeoutMs?: number): Promise<void> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
         try {
             const threadId = this.getActiveThreadId();
@@ -183,7 +244,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Execute step into command
      */
     public async stepInto(timeoutMs?: number): Promise<void> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
         try {
             const threadId = this.getActiveThreadId();
@@ -198,7 +259,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Execute step out command
      */
     public async stepOut(timeoutMs?: number): Promise<void> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
         try {
             const threadId = this.getActiveThreadId();
@@ -213,7 +274,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Execute continue command
      */
     public async continue(timeoutMs?: number): Promise<void> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
         try {
             const threadId = this.getActiveThreadId();
@@ -230,7 +291,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * inspection tools (variables / memory / registers) become valid.
      */
     public async pause(timeoutMs?: number): Promise<void> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
         try {
             const threadId = this.getActiveThreadId();
@@ -279,6 +340,76 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     }
 
     /**
+     * Run a raw GDB CLI command through the DAP `evaluate` REPL channel
+     * (`-exec <cmd>`).
+     *
+     * Important quirk: for side-effecting commands like `break` / `delete`,
+     * the `gdbtarget` adapter *runs the command* (the breakpoint binds, the
+     * delete happens) but the `evaluate` *response* is frequently empty or an
+     * error ("could not evaluate expression", "without frameId is not
+     * supported") because the adapter has no scalar `result` to hand back.
+     * So the evaluate response is NOT a reliable success signal — this helper
+     * never throws on an evaluate error; it returns the raw text (result or
+     * error message) plus an `errored` flag, and the caller decides whether
+     * the text contains a *definite* GDB rejection.
+     *
+     * A frameId is always supplied when one is available, since the adapter
+     * rejects REPL evaluates without one.
+     */
+    private async execGdbCommand(command: string, timeoutMs?: number): Promise<{ raw: string; errored: boolean }> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+        const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
+        const debugState = await this.getCurrentDebugState(0);
+        const frameOpt = debugState.frameId !== null ? { frameId: debugState.frameId } : {};
+        try {
+            const result = await customRequestWithTimeout<any>(session, 'evaluate', {
+                expression: `-exec ${command}`,
+                context: 'repl',
+                ...frameOpt,
+            }, dapMs);
+            return { raw: (result?.result ?? '').toString().trim(), errored: false };
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
+            // Adapter returned an error response — the command itself may
+            // still have run. Surface the text, do not treat as fatal.
+            return { raw: (err instanceof Error ? err.message : String(err)).trim(), errored: true };
+        }
+    }
+
+    /**
+     * Bind a breakpoint GDB-native via `-exec break file:line`.
+     *
+     * `vscode.debug.addBreakpoints()` populates VS Code's breakpoint *model*,
+     * but on `gdbtarget` sessions the resulting `setBreakpoints` DAP request
+     * is not reliably forwarded to the adapter — the target never stops.
+     * Issuing `break` through the GDB REPL is exactly what a raw GDB session
+     * does and binds the breakpoint for real. Returns the raw GDB/adapter
+     * text; the caller interprets it (a missing "Breakpoint N" echo is NOT a
+     * failure — see execGdbCommand).
+     */
+    public async setBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number): Promise<string> {
+        const { raw } = await this.execGdbCommand(`break ${fileFullPath}:${line}`, timeoutMs);
+        return raw;
+    }
+
+    /**
+     * Remove GDB-native breakpoints at a file:line via `-exec clear file:line`.
+     */
+    public async clearBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number): Promise<string> {
+        const { raw } = await this.execGdbCommand(`clear ${fileFullPath}:${line}`, timeoutMs);
+        return raw;
+    }
+
+    /**
+     * Delete every GDB-native breakpoint via `-exec delete`.
+     */
+    public async clearAllBreakpointsViaGdb(timeoutMs?: number): Promise<string> {
+        const { raw } = await this.execGdbCommand('delete', timeoutMs);
+        return raw;
+    }
+
+    /**
      * Remove a breakpoint from specified location
      */
     public async removeBreakpoint(uri: vscode.Uri, line: number): Promise<void> {
@@ -306,7 +437,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
         const state = new DebugState();
         
         try {
-            const activeSession = vscode.debug.activeDebugSession;
+            const activeSession = resolveActiveSession();
             if (activeSession) {
                 state.sessionActive = true;
                 state.updateConfigurationName(activeSession.configuration.name ?? null);
@@ -405,7 +536,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      */
     public async getVariables(frameId: number, scope?: 'local' | 'global' | 'all', timeoutMs?: number): Promise<any> {
         try {
-            const activeSession = vscode.debug.activeDebugSession;
+            const activeSession = resolveActiveSession();
             if (!activeSession) {
                 throw new Error('No active debug session');
             }
@@ -449,7 +580,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      */
     public async evaluateExpression(expression: string, frameId: number, timeoutMs?: number): Promise<any> {
         try {
-            const activeSession = vscode.debug.activeDebugSession;
+            const activeSession = resolveActiveSession();
             if (!activeSession) {
                 throw new Error('No active debug session');
             }
@@ -495,7 +626,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * (e.g. variables, memory, registers, step/continue).
      */
     public hasDebugSession(): boolean {
-        return vscode.debug.activeDebugSession !== undefined;
+        return resolveActiveSession() !== undefined;
     }
 
     /**
@@ -510,7 +641,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * is healthy and guarantees we don't hang indefinitely when it is not.
      */
     public async hasActiveSession(): Promise<boolean> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) {
             return false;
         }
@@ -542,8 +673,21 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Classify the current debug session for status-reporting purposes.
      * Never throws; intended to be safe to call even when the probe is hung.
      */
+    /**
+     * Low-level diagnostics — lets the agent tell apart "no session" from
+     * "stale extension build" or "debug session is in another VS Code window".
+     */
+    public getDiagnostics(): ExecutorDiagnostics {
+        return {
+            serverVersion: SERVER_VERSION,
+            liveSessionCount: getLiveSessionCount(),
+            liveSessionNames: getLiveSessionNames(),
+            hasVscodeActiveSession: vscode.debug.activeDebugSession !== undefined,
+        };
+    }
+
     public async getSessionStatus(): Promise<SessionStatus> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) {
             return {
                 state: 'no-session',
@@ -644,7 +788,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Get the active debug session
      */
     public getActiveSession(): vscode.DebugSession | undefined {
-        return vscode.debug.activeDebugSession;
+        return resolveActiveSession();
     }
 
     // ========== Embedded / Cortex-M specific methods ==========
@@ -654,7 +798,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Tries DAP readMemory first, falls back to GDB evaluate.
      */
     public async readMemory(address: string, length: number, timeoutMs?: number): Promise<Buffer> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
 
         // Normalize address to ensure 0x prefix
@@ -702,7 +846,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Read a single 32-bit word from target memory (little-endian).
      */
     public async readMemoryWord(address: string, timeoutMs?: number): Promise<number> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
 
         const addr = address.startsWith('0x') || address.startsWith('0X') ? address : `0x${address}`;
@@ -815,7 +959,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Read Cortex-M core registers (R0-R15, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK).
      */
     public async readCoreRegisters(timeoutMs?: number): Promise<Record<string, string>> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
 
         const registerNames = [
@@ -869,7 +1013,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
 
         // Fallback to memory-based read — cap the overall operation so a
         // peripheral with hundreds of registers cannot run past the global cap.
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
         const debugState = await this.getCurrentDebugState(0);
         const overallMs = capTimeout(timeoutMs, this.timeouts.memoryReadMs);
@@ -903,7 +1047,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * RTOS plugins), each task is enumerated as a thread.
      */
     public async getThreads(timeoutMs?: number): Promise<DapThread[]> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
 
         const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
@@ -937,7 +1081,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Get the call stack for a thread (defaults to the active thread).
      */
     public async getCallStack(threadId?: number, levels: number = 50, timeoutMs?: number): Promise<StackFrame[]> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
 
         const tid = threadId ?? this.getActiveThreadId();
@@ -968,7 +1112,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * Return information about the connected debug target.
      */
     public async getDeviceInfo(): Promise<string> {
-        const session = vscode.debug.activeDebugSession;
+        const session = resolveActiveSession();
         if (!session) { throw new Error('No active debug session'); }
 
         const config = session.configuration;

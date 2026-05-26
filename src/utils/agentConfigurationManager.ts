@@ -5,20 +5,86 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 
-export interface AgentInfo {
+export interface BaseAgentInfo {
     id: string;
     name: string;
     displayName: string;
     configPath: string;
-    mcpServerFieldName: string; 
+    configFormat: 'json' | 'toml';
 }
 
+export interface JsonAgentInfo extends BaseAgentInfo {
+    configFormat: 'json';
+    mcpServerFieldName: string;
+}
+
+export interface TomlAgentInfo extends BaseAgentInfo {
+    configFormat: 'toml';
+}
+
+export type AgentInfo = JsonAgentInfo | TomlAgentInfo;
+
 export interface MCPServerConfig {
-    autoApprove: string[];
-    disabled: boolean;
-    timeout: number;
     type: string;
     url: string;
+    autoApprove?: string[];
+    disabled?: boolean;
+    timeout?: number;
+    tools?: string[];
+}
+
+/**
+ * Insert or update the `[mcp_servers.cmsis-debugmcp]` block in a Codex
+ * `config.toml`, preserving the rest of the file. Codex configs are TOML,
+ * not JSON, so they cannot go through the generic JSON path.
+ */
+export function upsertCodexDebugMCPConfig(configContent: string, mcpServerUrl: string): string {
+    const normalizedConfigContent = configContent.replace(/\r\n/g, '\n');
+    const lines = normalizedConfigContent.split('\n');
+    const escapedUrl = escapeTomlString(mcpServerUrl);
+    const debugMCPSectionIndex = lines.findIndex(line => isCodexDebugMCPSectionHeader(line));
+
+    if (debugMCPSectionIndex === -1) {
+        const separator = normalizedConfigContent.length === 0
+            ? ''
+            : normalizedConfigContent.endsWith('\n') ? '\n' : '\n\n';
+        return `${normalizedConfigContent}${separator}[mcp_servers.cmsis-debugmcp]\nurl = "${escapedUrl}"\n`;
+    }
+
+    const nextSectionIndex = findNextTomlSectionIndex(lines, debugMCPSectionIndex + 1);
+    const debugMCPSectionEndIndex = nextSectionIndex === -1 ? lines.length : nextSectionIndex;
+
+    for (let index = debugMCPSectionIndex + 1; index < debugMCPSectionEndIndex; index++) {
+        const urlMatch = lines[index].match(/^(\s*)url\s*=.*$/);
+        if (urlMatch) {
+            lines[index] = `${urlMatch[1]}url = "${escapedUrl}"`;
+            return lines.join('\n');
+        }
+    }
+
+    lines.splice(debugMCPSectionIndex + 1, 0, `url = "${escapedUrl}"`);
+    return lines.join('\n');
+}
+
+function escapeTomlString(value: string): string {
+    return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+function findNextTomlSectionIndex(lines: string[], startIndex: number): number {
+    for (let index = startIndex; index < lines.length; index++) {
+        if (isTomlSectionHeader(lines[index])) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+function isTomlSectionHeader(line: string): boolean {
+    return /^\s*\[\[?[^\]]+\]\]?\s*(?:#.*)?$/.test(line);
+}
+
+function isCodexDebugMCPSectionHeader(line: string): boolean {
+    return /^\s*\[mcp_servers\.cmsis-debugmcp\]\s*(?:#.*)?$/.test(line);
 }
 
 export class AgentConfigurationManager {
@@ -120,49 +186,89 @@ export class AgentConfigurationManager {
         }
     }
 
+    private getCodexConfigPath(): string {
+        const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
+        return path.join(codexHome, 'config.toml');
+    }
+
+    private getCopilotCliConfigPath(): string {
+        const copilotHome = process.env.COPILOT_HOME || path.join(os.homedir(), '.copilot');
+        return path.join(copilotHome, 'mcp-config.json');
+    }
+
     /**
      * Get list of supported agents
      */
     private async getSupportedAgents(): Promise<AgentInfo[]> {
         const configBasePath = this.getConfigBasePath();
         const platform = os.platform();
-        
+
         console.log(`Detected platform: ${platform}, using config base path: ${configBasePath}`);
-        
+
         const agents: AgentInfo[] = [
             {
                 id: 'cline',
                 name: 'cline',
                 displayName: 'Cline',
                 configPath: path.join(configBasePath, 'Code', 'User', 'globalStorage', 'saoudrizwan.claude-dev', 'settings', 'cline_mcp_settings.json'),
+                configFormat: 'json',
                 mcpServerFieldName: 'mcpServers'
             },
-            // GitHub Copilot no longer needs a static mcp.json entry.
-            // The extension registers an McpServerDefinitionProvider at
-            // activation time, which eliminates the startup race condition
-            // and handles dynamic port assignment automatically.
+            // The GitHub Copilot *extension* in VS Code no longer needs a static
+            // mcp.json entry — the extension registers an McpServerDefinitionProvider
+            // at activation, which handles dynamic port assignment. The Copilot
+            // *CLI* is separate and does still need a static config file.
+            {
+                id: 'copilot-cli',
+                name: 'copilot-cli',
+                displayName: 'GitHub Copilot CLI',
+                configPath: this.getCopilotCliConfigPath(),
+                configFormat: 'json',
+                mcpServerFieldName: 'mcpServers'
+            },
             {
                 id: 'cursor',
                 name: 'cursor',
                 displayName: 'Cursor',
                 configPath: path.join(configBasePath, 'Cursor', 'User', 'globalStorage', 'cursor.mcp', 'settings', 'mcp_settings.json'),
+                configFormat: 'json',
                 mcpServerFieldName: 'mcpServers'
+            },
+            {
+                id: 'codex',
+                name: 'codex',
+                displayName: 'Codex',
+                configPath: this.getCodexConfigPath(),
+                configFormat: 'toml'
             }
         ];
 
         return agents;
     }
 
+    private getMCPServerUrl(): string {
+        return `http://localhost:${this.serverPort}/mcp`;
+    }
+
     /**
-     * Get CMSIS-DebugMCP server configuration with current port and timeout settings
+     * Get CMSIS-DebugMCP server configuration with current port and timeout settings.
+     * The Copilot CLI expects a `type: 'http'` entry with a `tools` allowlist.
      */
-    private getDebugMCPConfig(): MCPServerConfig {
+    private getDebugMCPConfig(agent?: AgentInfo): MCPServerConfig {
+        if (agent?.id === 'copilot-cli') {
+            return {
+                type: 'http',
+                url: this.getMCPServerUrl(),
+                tools: ['*'],
+            };
+        }
+
         return {
             autoApprove: [],
             disabled: false,
             timeout: this.timeoutInSeconds,
-            type: "streamableHttp",
-            url: `http://localhost:${this.serverPort}/mcp`
+            type: 'streamableHttp',
+            url: this.getMCPServerUrl(),
         };
     }
 
@@ -181,8 +287,22 @@ export class AgentConfigurationManager {
                 }
 
                 const configContent = await fs.promises.readFile(agent.configPath, 'utf8');
+
+                if (agent.configFormat === 'toml') {
+                    if (this.shouldMigrateCodexConfig(configContent)) {
+                        await fs.promises.writeFile(
+                            agent.configPath,
+                            upsertCodexDebugMCPConfig(configContent, this.getMCPServerUrl()),
+                            'utf8'
+                        );
+                        migrationCount++;
+                        console.log(`Successfully migrated ${agent.displayName} configuration`);
+                    }
+                    continue;
+                }
+
                 let config: any;
-                
+
                 try {
                     config = JSON.parse(configContent);
                 } catch {
@@ -206,7 +326,7 @@ export class AgentConfigurationManager {
                     console.log(`Migrating CMSIS-DebugMCP configuration for ${agent.displayName} from SSE to streamableHttp`);
 
                     // Update to new configuration
-                    config[fieldName]['cmsis-debugmcp'] = this.getDebugMCPConfig();
+                    config[fieldName]['cmsis-debugmcp'] = this.getDebugMCPConfig(agent);
 
                     // Preserve any custom autoApprove settings
                     if (debugmcpConfig.autoApprove && Array.isArray(debugmcpConfig.autoApprove)) {
@@ -237,6 +357,31 @@ export class AgentConfigurationManager {
     }
 
     /**
+     * Whether a Codex config.toml has a stale `cmsis-debugmcp` section still
+     * pointing at the deprecated `/sse` endpoint and needs rewriting.
+     */
+    private shouldMigrateCodexConfig(configContent: string): boolean {
+        const normalizedConfigContent = configContent.replace(/\r\n/g, '\n');
+        const lines = normalizedConfigContent.split('\n');
+        const debugMCPSectionIndex = lines.findIndex(line => isCodexDebugMCPSectionHeader(line));
+
+        if (debugMCPSectionIndex === -1) {
+            return false;
+        }
+
+        const nextSectionIndex = findNextTomlSectionIndex(lines, debugMCPSectionIndex + 1);
+        const debugMCPSectionEndIndex = nextSectionIndex === -1 ? lines.length : nextSectionIndex;
+
+        for (let index = debugMCPSectionIndex + 1; index < debugMCPSectionEndIndex; index++) {
+            if (/^\s*url\s*=.*\/sse["']?\s*(?:#.*)?$/.test(lines[index])) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
      * Add CMSIS-DebugMCP server configuration to the specified agent's config
      */
     private async addDebugMCPToAgent(agent: AgentInfo): Promise<boolean> {
@@ -245,6 +390,21 @@ export class AgentConfigurationManager {
             const configDir = path.dirname(agent.configPath);
             if (!fs.existsSync(configDir)) {
                 await fs.promises.mkdir(configDir, { recursive: true });
+            }
+
+            // Codex configs are TOML — handled by a dedicated upsert that
+            // preserves the rest of the file.
+            if (agent.configFormat === 'toml') {
+                const existing = fs.existsSync(agent.configPath)
+                    ? await fs.promises.readFile(agent.configPath, 'utf8')
+                    : '';
+                await fs.promises.writeFile(
+                    agent.configPath,
+                    upsertCodexDebugMCPConfig(existing, this.getMCPServerUrl()),
+                    'utf8'
+                );
+                console.log(`Successfully added CMSIS-DebugMCP configuration to ${agent.name}`);
+                return true;
             }
 
             let config: any = {};
@@ -267,7 +427,7 @@ export class AgentConfigurationManager {
             }
 
             // Add or update CMSIS-DebugMCP configuration with current settings
-            config[fieldName]['cmsis-debugmcp'] = this.getDebugMCPConfig();
+            config[fieldName]['cmsis-debugmcp'] = this.getDebugMCPConfig(agent);
 
             // Write the updated config back to file
             await fs.promises.writeFile(
