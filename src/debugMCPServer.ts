@@ -56,7 +56,7 @@ export class DebugMCPServer {
     private createMcpServer(): McpServer {
         const mcpServer = new McpServer({
             name: 'cmsis-debugmcp',
-            version: '1.1.9',
+            version: '1.1.10',
         });
         this.setupTools(mcpServer);
         this.setupResources(mcpServer);
@@ -725,8 +725,8 @@ export class DebugMCPServer {
                 });
             });
 
-            // Try the configured port first; fall back to an OS-assigned port
-            // so multiple IDE windows each get their own server.
+            // Try the configured port first; if busy, walk upward to the next
+            // free port so multiple IDE windows each get their own server.
             this.httpServer = await this.listenWithFallback(app, this.port);
             const addr = this.httpServer.address();
             this.actualPort = typeof addr === 'object' && addr ? addr.port : this.port;
@@ -739,22 +739,40 @@ export class DebugMCPServer {
     }
 
     /**
-     * Try to listen on preferredPort. If it is already in use, let the OS
-     * assign a free port (port 0) so multiple IDE instances never collide.
+     * Try to listen on preferredPort. If it is already in use, walk upward
+     * (preferredPort+1, preferredPort+2, …) until a free port is found, so
+     * each IDE window gets its own deterministic port (3001, 3002, …) instead
+     * of a random one. Only if the whole sequential range is exhausted do we
+     * fall back to an OS-assigned port (0).
      */
     private listenWithFallback(app: ReturnType<typeof express>, preferredPort: number): Promise<http.Server> {
-        return new Promise<http.Server>((resolve, reject) => {
-            const server = app.listen(preferredPort, () => resolve(server));
-            server.on('error', (err: NodeJS.ErrnoException) => {
-                if (err.code === 'EADDRINUSE') {
-                    logger.warn(`Port ${preferredPort} already in use – requesting OS-assigned port`);
-                    const fallback = app.listen(0, () => resolve(fallback));
-                    fallback.on('error', reject);
-                } else {
-                    reject(err);
-                }
+        const maxAttempts = 64; // scan preferredPort .. preferredPort+63, then OS-assigned
+
+        const tryListen = (port: number, attempt: number): Promise<http.Server> =>
+            new Promise<http.Server>((resolve, reject) => {
+                const server = app.listen(port, () => {
+                    if (port !== preferredPort) {
+                        logger.info(`Port ${preferredPort} busy – bound to next free port ${port}`);
+                    }
+                    resolve(server);
+                });
+                server.on('error', (err: NodeJS.ErrnoException) => {
+                    if (err.code !== 'EADDRINUSE') {
+                        reject(err);
+                        return;
+                    }
+                    if (attempt + 1 < maxAttempts) {
+                        logger.warn(`Port ${port} already in use – trying ${port + 1}`);
+                        resolve(tryListen(port + 1, attempt + 1));
+                    } else {
+                        logger.warn(`Ports ${preferredPort}..${port} all busy – requesting OS-assigned port`);
+                        const fallback = app.listen(0, () => resolve(fallback));
+                        fallback.on('error', reject);
+                    }
+                });
             });
-        });
+
+        return tryListen(preferredPort, 0);
     }
 
     /**
