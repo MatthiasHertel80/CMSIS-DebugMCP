@@ -54,7 +54,10 @@ export async function activate(context: vscode.ExtensionContext) {
         
         const endpoint = mcpServer.getEndpoint();
         logger.info(`CMSIS-DebugMCP server running at: ${endpoint}`);
-        vscode.window.showInformationMessage(`CMSIS-DebugMCP server running on ${endpoint}`);
+        const portInfo = actualPort === serverPort
+            ? `port ${actualPort}`
+            : `port ${actualPort} (default ${serverPort} was busy — likely another VS Code window)`;
+        vscode.window.showInformationMessage(`CMSIS-DebugMCP running on ${portInfo} — ${endpoint}`);
 
         // Register as a VS Code MCP server definition provider so Copilot
         // discovers this server without a static mcp.json entry (which
