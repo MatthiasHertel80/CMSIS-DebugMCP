@@ -729,7 +729,7 @@ export class DebugMCPServer {
             // free port so multiple IDE windows each get their own server.
             this.httpServer = await this.listenWithFallback(app, this.port);
             const addr = this.httpServer.address();
-            this.actualPort = typeof addr === 'object' && addr ? addr.port : this.port;
+            this.actualPort = addr && typeof addr === 'object' ? addr.port : this.port;
             logger.info(`CMSIS-DebugMCP server started successfully on port ${this.actualPort}`);
 
         } catch (error) {
@@ -744,35 +744,58 @@ export class DebugMCPServer {
      * each IDE window gets its own deterministic port (3001, 3002, …) instead
      * of a random one. Only if the whole sequential range is exhausted do we
      * fall back to an OS-assigned port (0).
+     *
+     * Implemented as a sequential async loop: an earlier version chained the
+     * retries via `resolve(tryListen(port + 1))`, but promise adoption there
+     * could resolve the outer promise with a non-listening server whose
+     * `address()` returned null — so the caller fell back to the configured
+     * port and every window reported 3001. A plain await loop avoids that.
      */
-    private listenWithFallback(app: ReturnType<typeof express>, preferredPort: number): Promise<http.Server> {
+    private async listenWithFallback(app: ReturnType<typeof express>, preferredPort: number): Promise<http.Server> {
         const maxAttempts = 64; // scan preferredPort .. preferredPort+63, then OS-assigned
 
-        const tryListen = (port: number, attempt: number): Promise<http.Server> =>
-            new Promise<http.Server>((resolve, reject) => {
-                const server = app.listen(port, () => {
-                    if (port !== preferredPort) {
-                        logger.info(`Port ${preferredPort} busy – bound to next free port ${port}`);
-                    }
-                    resolve(server);
-                });
-                server.on('error', (err: NodeJS.ErrnoException) => {
-                    if (err.code !== 'EADDRINUSE') {
-                        reject(err);
-                        return;
-                    }
-                    if (attempt + 1 < maxAttempts) {
-                        logger.warn(`Port ${port} already in use – trying ${port + 1}`);
-                        resolve(tryListen(port + 1, attempt + 1));
-                    } else {
-                        logger.warn(`Ports ${preferredPort}..${port} all busy – requesting OS-assigned port`);
-                        const fallback = app.listen(0, () => resolve(fallback));
-                        fallback.on('error', reject);
-                    }
-                });
-            });
+        for (let port = preferredPort; port < preferredPort + maxAttempts; port++) {
+            try {
+                const server = await this.listenOnce(app, port);
+                if (port !== preferredPort) {
+                    logger.info(`Port ${preferredPort} busy – bound to next free port ${port}`);
+                }
+                return server;
+            } catch (err) {
+                const e = err as NodeJS.ErrnoException;
+                if (e.code !== 'EADDRINUSE') {
+                    throw e;
+                }
+                logger.warn(`Port ${port} already in use – trying ${port + 1}`);
+            }
+        }
 
-        return tryListen(preferredPort, 0);
+        // Sequential range exhausted – let the OS assign any free port.
+        logger.warn(`Ports ${preferredPort}..${preferredPort + maxAttempts - 1} all busy – requesting OS-assigned port`);
+        return this.listenOnce(app, 0);
+    }
+
+    /**
+     * Bind a single fresh HTTP server to the given port. Resolves only once
+     * the server is actually listening (so `address()` is valid), and rejects
+     * on the first error (closing the dead server) so the caller can retry.
+     */
+    private listenOnce(app: ReturnType<typeof express>, port: number): Promise<http.Server> {
+        return new Promise<http.Server>((resolve, reject) => {
+            const server = http.createServer(app);
+            const onError = (err: NodeJS.ErrnoException) => {
+                server.removeListener('listening', onListening);
+                server.close(() => { /* ignore */ });
+                reject(err);
+            };
+            const onListening = () => {
+                server.removeListener('error', onError);
+                resolve(server);
+            };
+            server.once('error', onError);
+            server.once('listening', onListening);
+            server.listen(port);
+        });
     }
 
     /**
