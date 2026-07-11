@@ -11,11 +11,45 @@ import {
     DebuggingHandler,
     IDebuggingHandler
 } from '.';
-import { HardwareTimeouts } from './debuggingExecutor';
+import { HardwareTimeouts, SERVER_VERSION } from './debuggingExecutor';
 import { logger } from './utils/logger';
 import { serialHandler } from './serialHandler';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+
+/** The server must never be reachable off-box — it flashes and erases hardware without auth. */
+const LOOPBACK_BIND_ADDRESS = '127.0.0.1';
+
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '::1', '[::1]']);
+
+/**
+ * True when an HTTP Host header (hostname with optional port) refers to the
+ * loopback interface. A missing Host header is rejected — every legitimate
+ * HTTP/1.1 client sends one.
+ */
+export function isLoopbackHostHeader(host: unknown): boolean {
+    if (typeof host !== 'string' || host.length === 0) {
+        return false;
+    }
+    // Strip the port: "[::1]:3001" → "[::1]", "localhost:3001" → "localhost".
+    const hostname = host.startsWith('[')
+        ? host.replace(/^(\[[^\]]*\]).*$/, '$1')
+        : host.replace(/:\d+$/, '');
+    return LOOPBACK_HOSTNAMES.has(hostname.toLowerCase());
+}
+
+/**
+ * True when an Origin header value is a loopback origin (or a non-web value
+ * like "null" is absent — browsers send Origin on cross-site POSTs, so a
+ * present non-loopback Origin means a foreign web page is calling us).
+ */
+export function isLoopbackOrigin(origin: string): boolean {
+    try {
+        return LOOPBACK_HOSTNAMES.has(new URL(origin).hostname.toLowerCase());
+    } catch {
+        return false;
+    }
+}
 
 /**
  * Main MCP server class that exposes debugging functionality as tools and resources.
@@ -29,7 +63,6 @@ export class DebugMCPServer {
     private actualPort: number | null = null;
     private initialized: boolean = false;
     private debuggingHandler: IDebuggingHandler;
-    private transports: Map<string, StreamableHTTPServerTransport> = new Map();
 
     constructor(port: number, timeoutInSeconds: number, hardwareTimeouts?: Partial<HardwareTimeouts>) {
         // Initialize the debugging components with dependency injection
@@ -56,7 +89,7 @@ export class DebugMCPServer {
     private createMcpServer(): McpServer {
         const mcpServer = new McpServer({
             name: 'cmsis-debugmcp',
-            version: '1.1.9',
+            version: SERVER_VERSION,
         });
         this.setupTools(mcpServer);
         this.setupResources(mcpServer);
@@ -649,34 +682,6 @@ export class DebugMCPServer {
     }
 
     /**
-     * Check if the server is already running
-     */
-    private async isServerRunning(): Promise<boolean> {
-        return new Promise<boolean>((resolve) => {
-            const request = http.request({
-                hostname: 'localhost',
-                port: this.port,
-                path: '/',
-                method: 'GET',
-                timeout: 1000
-            }, () => {
-                resolve(true); // Server is responding
-            });
-
-            request.on('error', () => {
-                resolve(false); // Server is not running
-            });
-
-            request.on('timeout', () => {
-                request.destroy();
-                resolve(false); // Server is not responding
-            });
-
-            request.end();
-        });
-    }
-
-    /**
      * Start the MCP server with Streamable HTTP transport
      */
     async start(): Promise<void> {
@@ -684,6 +689,27 @@ export class DebugMCPServer {
             logger.info(`Starting CMSIS-DebugMCP server (preferred port ${this.port})...`);
 
             const app = express();
+
+            // Defense-in-depth against DNS rebinding: the server is bound to
+            // the loopback interface (below), but a malicious web page can
+            // still reach 127.0.0.1 through the victim's browser by pointing
+            // its own DNS record at 127.0.0.1 — the browser then happily
+            // POSTs to "attacker.com" which resolves to this server. Such
+            // requests carry the attacker's Host/Origin, so reject anything
+            // that isn't loopback. Port-agnostic on purpose: the server may
+            // run on an OS-assigned fallback port.
+            app.use((req: any, res: any, next: any) => {
+                if (!isLoopbackHostHeader(req.headers.host)) {
+                    res.status(403).json({ error: 'Forbidden: non-local Host header' });
+                    return;
+                }
+                const origin = req.headers.origin;
+                if (typeof origin === 'string' && !isLoopbackOrigin(origin)) {
+                    res.status(403).json({ error: 'Forbidden: non-local Origin' });
+                    return;
+                }
+                next();
+            });
 
             // Parse JSON body for incoming requests
             app.use(express.json());
@@ -728,9 +754,22 @@ export class DebugMCPServer {
             // Try the configured port first; fall back to an OS-assigned port
             // so multiple IDE windows each get their own server.
             this.httpServer = await this.listenWithFallback(app, this.port);
+
+            // The port is read back from the bound socket, never assumed from
+            // `this.port` — a wrong value here would make us advertise another
+            // window's server to our agents.
             const addr = this.httpServer.address();
-            this.actualPort = typeof addr === 'object' && addr ? addr.port : this.port;
-            logger.info(`CMSIS-DebugMCP server started successfully on port ${this.actualPort}`);
+            if (typeof addr !== 'object' || addr === null) {
+                throw new Error('HTTP server reported no address after binding');
+            }
+            this.actualPort = addr.port;
+
+            // Keep a permanent error listener attached: an unhandled 'error'
+            // on the server (e.g. the socket dies later) would otherwise take
+            // down the extension host.
+            this.httpServer.on('error', (err) => logger.error('MCP HTTP server error', err));
+
+            logger.info(`CMSIS-DebugMCP server started successfully on 127.0.0.1:${this.actualPort}`);
 
         } catch (error) {
             logger.error(`Failed to start CMSIS-DebugMCP server`, error);
@@ -739,31 +778,61 @@ export class DebugMCPServer {
     }
 
     /**
-     * Try to listen on preferredPort. If it is already in use, let the OS
-     * assign a free port (port 0) so multiple IDE instances never collide.
+     * Bind one listener and resolve only once the socket is really listening.
+     *
+     * Do NOT use express's `app.listen(port, host, callback)` callback as a
+     * success signal: in Express 5 that callback is invoked unconditionally,
+     * before the bind result is known, so on EADDRINUSE it fires with
+     * `server.address() === null` and the 'error' event follows afterwards.
+     * Only the server's own 'listening' event means the bind succeeded.
      */
-    private listenWithFallback(app: ReturnType<typeof express>, preferredPort: number): Promise<http.Server> {
+    private listenOnce(app: ReturnType<typeof express>, port: number, host: string): Promise<http.Server> {
         return new Promise<http.Server>((resolve, reject) => {
-            const server = app.listen(preferredPort, () => resolve(server));
-            server.on('error', (err: NodeJS.ErrnoException) => {
-                if (err.code === 'EADDRINUSE') {
-                    logger.warn(`Port ${preferredPort} already in use – requesting OS-assigned port`);
-                    const fallback = app.listen(0, () => resolve(fallback));
-                    fallback.on('error', reject);
-                } else {
-                    reject(err);
-                }
-            });
+            const server = app.listen(port, host);
+
+            const onListening = () => {
+                server.removeListener('error', onError);
+                resolve(server);
+            };
+            const onError = (err: NodeJS.ErrnoException) => {
+                server.removeListener('listening', onListening);
+                server.close(() => { /* nothing bound; just release the handle */ });
+                reject(err);
+            };
+
+            server.once('listening', onListening);
+            server.once('error', onError);
         });
+    }
+
+    /**
+     * Try to listen on preferredPort. If it is already in use, let the OS
+     * assign a free port (port 0) so multiple IDE windows each get their own
+     * server instead of silently sharing one.
+     *
+     * Binds the loopback interface only — this server exposes flash, memory
+     * and GDB access with no authentication, and must never be reachable
+     * from the network. (VS Code Remote / WSL port forwarding operates on
+     * localhost, so remote setups keep working.)
+     */
+    private async listenWithFallback(app: ReturnType<typeof express>, preferredPort: number): Promise<http.Server> {
+        try {
+            return await this.listenOnce(app, preferredPort, LOOPBACK_BIND_ADDRESS);
+        } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') {
+                throw err;
+            }
+            logger.warn(`Port ${preferredPort} already in use – requesting OS-assigned port`);
+            return await this.listenOnce(app, 0, LOOPBACK_BIND_ADDRESS);
+        }
     }
 
     /**
      * Stop the MCP server
      */
     async stop() {
-        // Note: With stateless StreamableHTTPServerTransport, transports are closed per-request
-        // No need to track and close them manually
-        this.transports.clear();
+        // Note: With stateless StreamableHTTPServerTransport, transports are
+        // closed per-request — there is nothing to track and close manually.
 
         // Release any owned serial port and unsubscribe from the Serial Monitor bridge.
         try {
@@ -778,10 +847,10 @@ export class DebugMCPServer {
 
         // Close the HTTP server
         if (this.httpServer) {
-            await new Promise<void>((resolve) => {
-                this.httpServer!.close(() => resolve());
-            });
+            const server = this.httpServer;
             this.httpServer = null;
+            this.actualPort = null;
+            await new Promise<void>((resolve) => server.close(() => resolve()));
         }
 
         logger.info('CMSIS-DebugMCP server stopped');

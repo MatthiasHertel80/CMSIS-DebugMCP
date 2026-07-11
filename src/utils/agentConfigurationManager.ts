@@ -25,8 +25,11 @@ export interface TomlAgentInfo extends BaseAgentInfo {
 export type AgentInfo = JsonAgentInfo | TomlAgentInfo;
 
 export interface MCPServerConfig {
-    type: string;
-    url: string;
+    type?: string;
+    url?: string;
+    // stdio-bridge shape (Claude Desktop has no native HTTP transport)
+    command?: string;
+    args?: string[];
     autoApprove?: string[];
     disabled?: boolean;
     timeout?: number;
@@ -89,7 +92,9 @@ function isCodexDebugMCPSectionHeader(line: string): boolean {
 
 export class AgentConfigurationManager {
     private context: vscode.ExtensionContext;
-    private readonly POPUP_SHOWN_KEY = 'cmsis-debugmcp.popupShown';
+    // Versioned so the popup re-appears once when new agents are added to
+    // the roster (v2: Claude Code + Claude Desktop).
+    private readonly POPUP_SHOWN_KEY = 'cmsis-debugmcp.popupShown.v2';
     private readonly timeoutInSeconds: number;
     private serverPort: number;
     
@@ -197,6 +202,19 @@ export class AgentConfigurationManager {
     }
 
     /**
+     * Claude Code stores user-scoped MCP servers in a top-level `mcpServers`
+     * key of ~/.claude.json. The file also holds session history and other
+     * state, so it must only ever be merged into, never recreated.
+     */
+    private getClaudeCodeConfigPath(): string {
+        return path.join(os.homedir(), '.claude.json');
+    }
+
+    private getClaudeDesktopConfigPath(): string {
+        return path.join(this.getConfigBasePath(), 'Claude', 'claude_desktop_config.json');
+    }
+
+    /**
      * Get list of supported agents
      */
     private async getSupportedAgents(): Promise<AgentInfo[]> {
@@ -240,6 +258,22 @@ export class AgentConfigurationManager {
                 displayName: 'Codex',
                 configPath: this.getCodexConfigPath(),
                 configFormat: 'toml'
+            },
+            {
+                id: 'claude-code',
+                name: 'claude-code',
+                displayName: 'Claude Code',
+                configPath: this.getClaudeCodeConfigPath(),
+                configFormat: 'json',
+                mcpServerFieldName: 'mcpServers'
+            },
+            {
+                id: 'claude-desktop',
+                name: 'claude-desktop',
+                displayName: 'Claude Desktop',
+                configPath: this.getClaudeDesktopConfigPath(),
+                configFormat: 'json',
+                mcpServerFieldName: 'mcpServers'
             }
         ];
 
@@ -251,8 +285,21 @@ export class AgentConfigurationManager {
     }
 
     /**
+     * Write via a temp file + rename so a crash mid-write can never leave a
+     * half-written config behind (some of these files, e.g. ~/.claude.json,
+     * hold state well beyond MCP entries).
+     */
+    private async writeFileAtomic(filePath: string, content: string): Promise<void> {
+        const tmpPath = `${filePath}.cmsis-debugmcp.tmp`;
+        await fs.promises.writeFile(tmpPath, content, 'utf8');
+        await fs.promises.rename(tmpPath, filePath);
+    }
+
+    /**
      * Get CMSIS-DebugMCP server configuration with current port and timeout settings.
      * The Copilot CLI expects a `type: 'http'` entry with a `tools` allowlist.
+     * Claude Code takes a plain `type: 'http'` entry; Claude Desktop only
+     * supports stdio servers, so it gets an `mcp-remote` bridge.
      */
     private getDebugMCPConfig(agent?: AgentInfo): MCPServerConfig {
         if (agent?.id === 'copilot-cli') {
@@ -260,6 +307,20 @@ export class AgentConfigurationManager {
                 type: 'http',
                 url: this.getMCPServerUrl(),
                 tools: ['*'],
+            };
+        }
+
+        if (agent?.id === 'claude-code') {
+            return {
+                type: 'http',
+                url: this.getMCPServerUrl(),
+            };
+        }
+
+        if (agent?.id === 'claude-desktop') {
+            return {
+                command: 'npx',
+                args: ['-y', 'mcp-remote', this.getMCPServerUrl()],
             };
         }
 
@@ -316,17 +377,36 @@ export class AgentConfigurationManager {
                     continue; // CMSIS-DebugMCP not configured for this agent
                 }
 
-                // Check if it's using the old SSE configuration
-                const needsMigration =
+                // Migrate only when the existing entry doesn't match the
+                // transport this agent should use: legacy /sse endpoints, or
+                // a transport type that differs from the desired one. For
+                // agents whose correct type IS 'http' (Copilot CLI, Claude
+                // Code) an 'http' entry is current, not legacy.
+                const desiredConfig = this.getDebugMCPConfig(agent);
+                const isLegacySse =
                     debugmcpConfig.type === 'sse' ||
-                    debugmcpConfig.type === 'http' ||
-                    (debugmcpConfig.url && debugmcpConfig.url.endsWith('/sse'));
+                    (typeof debugmcpConfig.url === 'string' && debugmcpConfig.url.endsWith('/sse'));
+                const isWrongTransport =
+                    desiredConfig.type !== undefined &&
+                    debugmcpConfig.type !== undefined &&
+                    debugmcpConfig.type !== desiredConfig.type;
+                // A stale endpoint (e.g. the server fell back to an
+                // OS-assigned port) is refreshed silently — the entry would
+                // otherwise point at a dead port.
+                const isStaleEndpoint =
+                    (typeof debugmcpConfig.url === 'string' &&
+                        desiredConfig.url !== undefined &&
+                        debugmcpConfig.url !== desiredConfig.url) ||
+                    (Array.isArray(debugmcpConfig.args) &&
+                        desiredConfig.args !== undefined &&
+                        JSON.stringify(debugmcpConfig.args) !== JSON.stringify(desiredConfig.args));
+                const needsMigration = isLegacySse || isWrongTransport || isStaleEndpoint;
 
                 if (needsMigration) {
-                    console.log(`Migrating CMSIS-DebugMCP configuration for ${agent.displayName} from SSE to streamableHttp`);
+                    console.log(`Migrating CMSIS-DebugMCP configuration for ${agent.displayName} to the ${desiredConfig.type ?? 'stdio-bridge'} transport`);
 
                     // Update to new configuration
-                    config[fieldName]['cmsis-debugmcp'] = this.getDebugMCPConfig(agent);
+                    config[fieldName]['cmsis-debugmcp'] = desiredConfig;
 
                     // Preserve any custom autoApprove settings
                     if (debugmcpConfig.autoApprove && Array.isArray(debugmcpConfig.autoApprove)) {
@@ -334,13 +414,16 @@ export class AgentConfigurationManager {
                     }
                     
                     // Write the migrated config
-                    await fs.promises.writeFile(
+                    await this.writeFileAtomic(
                         agent.configPath,
-                        JSON.stringify(config, null, 2),
-                        'utf8'
+                        JSON.stringify(config, null, 2)
                     );
                     
-                    migrationCount++;
+                    // Only legacy-transport migrations get counted toward the
+                    // user-facing toast; silent endpoint refreshes don't.
+                    if (isLegacySse || isWrongTransport) {
+                        migrationCount++;
+                    }
                     console.log(`Successfully migrated ${agent.displayName} configuration`);
                 }
             } catch (error) {
@@ -408,15 +491,23 @@ export class AgentConfigurationManager {
             }
 
             let config: any = {};
-            
+
             // Read existing config if it exists
             if (fs.existsSync(agent.configPath)) {
                 const configContent = await fs.promises.readFile(agent.configPath, 'utf8');
                 try {
                     config = JSON.parse(configContent);
                 } catch (parseError) {
-                    console.warn(`Failed to parse existing config for ${agent.name}, creating new config`);
-                    config = {};
+                    // Never recreate an unparseable config — files like
+                    // ~/.claude.json hold far more than MCP entries, and
+                    // replacing them with a fresh object would destroy the
+                    // user's state. Bail out and let the user fix the file.
+                    console.error(`Existing config for ${agent.name} is not valid JSON — refusing to overwrite it`);
+                    vscode.window.showErrorMessage(
+                        `Cannot configure ${agent.displayName}: ${agent.configPath} exists but is not valid JSON. ` +
+                        'Please fix or remove the file and try again.'
+                    );
+                    return false;
                 }
             }
 
@@ -430,10 +521,9 @@ export class AgentConfigurationManager {
             config[fieldName]['cmsis-debugmcp'] = this.getDebugMCPConfig(agent);
 
             // Write the updated config back to file
-            await fs.promises.writeFile(
+            await this.writeFileAtomic(
                 agent.configPath,
-                JSON.stringify(config, null, 2),
-                'utf8'
+                JSON.stringify(config, null, 2)
             );
 
             console.log(`Successfully added CMSIS-DebugMCP configuration to ${agent.name}`);

@@ -2,6 +2,7 @@
 
 import * as vscode from 'vscode';
 import { DebugMCPServer } from './debugMCPServer';
+import { SERVER_VERSION } from './debuggingExecutor';
 import { AgentConfigurationManager } from './utils/agentConfigurationManager';
 import { logger, LogLevel } from './utils/logger';
 import { registerSessionStateTracker } from './utils/sessionStateTracker';
@@ -68,7 +69,7 @@ export async function activate(context: vscode.ExtensionContext) {
                             'CMSIS-DebugMCP',
                             mcpUri,
                             undefined,
-                            '1.1.9',
+                            SERVER_VERSION,
                         ),
                     ];
                 },
@@ -88,6 +89,25 @@ export async function activate(context: vscode.ExtensionContext) {
     } catch (error) {
         logger.error('Error migrating existing configurations', error);
     }
+
+    // Changing the port has no effect until the server is rebuilt, and the
+    // agent configs still point at the old one. Tell the user rather than
+    // leaving them with a setting that silently does nothing.
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration(async (event) => {
+            if (!event.affectsConfiguration('cmsis-debugmcp.serverPort')) {
+                return;
+            }
+            const reload = 'Reload Window';
+            const choice = await vscode.window.showInformationMessage(
+                'CMSIS-DebugMCP: the server port setting changed. Reload the window to restart the MCP server on the new port.',
+                reload,
+            );
+            if (choice === reload) {
+                await vscode.commands.executeCommand('workbench.action.reloadWindow');
+            }
+        }),
+    );
 
     // Register commands
     registerCommands(context);

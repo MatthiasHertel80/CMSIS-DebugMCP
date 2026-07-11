@@ -2,13 +2,13 @@
 
 CMSIS-DebugMCP is an MCP server that lets an AI agent drive the VS Code debugger against Arm Cortex-M targets through the **CMSIS Debugger** extension — setting breakpoints, stepping, reading memory and core registers, decoding fault status, and inspecting peripheral registers via SVD. It also retains general multi-language debugging support (Python, JavaScript/TypeScript, Java, C#, C++, Go, Rust, PHP, Ruby) inherited from the upstream DebugMCP project.
 
-Works with **GitHub Copilot**, **Cline**, **Cursor**, and any MCP-compatible assistant.
+Works with **GitHub Copilot**, **Claude Code**, **Claude Desktop**, **Cline**, **Cursor**, and any MCP-compatible assistant.
 
 > This project is a fork of [microsoft/DebugMCP](https://github.com/microsoft/DebugMCP) extended for Arm embedded workflows. See [CHANGELOG.md](CHANGELOG.md) for the list of embedded-specific additions.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.104.0+-blue.svg)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-1.0.27-green.svg)](https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases)
+[![Version](https://img.shields.io/badge/version-1.2.0-green.svg)](https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases)
 
 <p align="center">
   <img src="assets/DebugMCP.webp" alt="CMSIS-DebugMCP Demo" width="800">
@@ -230,6 +230,37 @@ Add to Cursor's MCP settings:
 }
 ```
 
+#### Claude Code
+Either use the agent selection popup, or register from a terminal:
+```bash
+claude mcp add --transport http --scope user cmsis-debugmcp http://localhost:3001/mcp
+```
+This writes a user-scoped entry to the top-level `mcpServers` of `~/.claude.json`:
+```json
+{
+  "mcpServers": {
+    "cmsis-debugmcp": {
+      "type": "http",
+      "url": "http://localhost:3001/mcp"
+    }
+  }
+}
+```
+
+#### Claude Desktop
+Claude Desktop only supports stdio MCP servers, so the extension registers an `mcp-remote` bridge (requires Node.js/`npx` on PATH) in `claude_desktop_config.json`:
+```json
+{
+  "mcpServers": {
+    "cmsis-debugmcp": {
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://localhost:3001/mcp"]
+    }
+  }
+}
+```
+Config file location: `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS), `%APPDATA%\Claude\claude_desktop_config.json` (Windows), `~/.config/Claude/claude_desktop_config.json` (Linux).
+
 ### Extension Settings
 
 Configure CMSIS-DebugMCP behavior in VSCode settings:
@@ -243,8 +274,18 @@ Configure CMSIS-DebugMCP behavior in VSCode settings:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `cmsis-debugmcp.serverPort` | `3001` | Port number for the MCP server |
+| `cmsis-debugmcp.serverPort` | `3001` | Preferred port for the MCP server. If busy, an OS-assigned port is used instead. |
 | `cmsis-debugmcp.timeoutInSeconds` | `180` | Timeout for debugging operations |
+
+Changing `serverPort` requires a window reload; the extension will offer to do it for you.
+
+### Networking and multiple windows
+
+The MCP server binds **`127.0.0.1` only** and rejects requests whose `Host`/`Origin` is not a loopback address. It has no authentication and can flash, erase, and read the memory of attached hardware, so it must never be exposed to a network. VS Code Remote SSH / WSL / Codespaces forward localhost, so those setups work unchanged.
+
+Each VS Code window runs its own server. The first window to activate takes `serverPort`; later windows fall back to an OS-assigned port, so a window never shares another window's debug session. In-editor agents (Copilot) discover the right port automatically via the registered `McpServerDefinitionProvider`.
+
+External CLI agents (Claude Code, Codex, Copilot CLI) read a single global config file, which can only name one URL — the most recently activated window wins. If you drive hardware from a CLI agent, keep one CMSIS-DebugMCP window open, or re-run **CMSIS-DebugMCP: Show Agent Selection Popup** from the window you want the agent to attach to.
 
 
 ## FAQ
@@ -252,7 +293,7 @@ Configure CMSIS-DebugMCP behavior in VSCode settings:
 <details>
 <summary><b>Which AI assistants are supported?</b></summary>
 
-CMSIS-DebugMCP works with any MCP-compatible AI assistant, including **GitHub Copilot**, **Cline**, **Cursor**, **Roo Code**, **Windsurf**, and others. If your assistant supports the Model Context Protocol, it can use CMSIS-DebugMCP.
+CMSIS-DebugMCP works with any MCP-compatible AI assistant, including **GitHub Copilot**, **Claude Code**, **Claude Desktop**, **Cline**, **Cursor**, **Roo Code**, **Windsurf**, and others. If your assistant supports the Model Context Protocol, it can use CMSIS-DebugMCP.
 </details>
 
 <details>

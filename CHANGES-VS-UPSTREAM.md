@@ -4,7 +4,7 @@ This fork of [microsoft/DebugMCP](https://github.com/microsoft/DebugMCP) adapts 
 
 Upstream commit this fork is based on: [`4422d8c` — "upgrade version"](https://github.com/microsoft/DebugMCP/commit/4422d8c).
 
-Current fork release: **v1.0.27** (2026-05-18) — see [CHANGELOG.md](CHANGELOG.md) for the per-version detail.
+Current fork release: **v1.2.0** (2026-07-11) — see [CHANGELOG.md](CHANGELOG.md) for the per-version detail.
 
 ---
 

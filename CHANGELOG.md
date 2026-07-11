@@ -6,6 +6,26 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-11
+
+### Added
+- **Claude Code and Claude Desktop registration.** Both now appear in the agent selection popup and the manual configuration command. Claude Code gets a user-scoped `{"type": "http", "url": ...}` entry in the top-level `mcpServers` of `~/.claude.json`; Claude Desktop (which supports only stdio servers) gets an `npx mcp-remote <url>` bridge entry in `claude_desktop_config.json`. The one-time agent popup re-appears once after upgrading so existing installs can opt in.
+
+### Security
+- **MCP server now binds the loopback interface only.** `app.listen(port)` without a host binds `0.0.0.0`, so the server — which exposes flash download, erase, memory reads, and arbitrary GDB expression evaluation without authentication — was reachable from the local network, contradicting the README's "runs 100% locally". Both the preferred-port and the OS-assigned-fallback listeners now bind `127.0.0.1`. VS Code Remote / WSL port forwarding is unaffected (it forwards localhost).
+- **DNS-rebinding protection.** Requests whose `Host` header (or `Origin`, when present) is not a loopback address are rejected with 403. Without this, a malicious web page could point its own DNS name at `127.0.0.1` and drive the debugger through the victim's browser — loopback binding alone does not stop that.
+
+### Fixed
+- **Port fallback silently pointed a second VS Code window at the first window's debug server (the port-allocation bug).** `listenWithFallback()` used the `app.listen(port, host, callback)` callback as its success signal, but in Express 5 that callback is invoked unconditionally — *before* the bind result is known. On `EADDRINUSE` it fired with `server.address() === null`, the promise resolved with the dead, unbound server, and the `EADDRINUSE` handler's fallback listener resolved nothing and was leaked. `getActualPort()` then fell back to the *configured* port (3001) — the one already owned by the first window. Consequences: the second window reported "server running on :3001", registered `:3001` with Copilot and wrote it into every agent config, and its agent then drove the **first window's debug session and hardware target** — while the second window's own server accepted no connections at all. Bind success is now taken from the server's `listening` event, the port is read back from the bound socket, and `start()` fails loudly rather than guessing a port.
+- A persistent `error` listener is now attached to the running HTTP server; previously a post-startup socket error would have been an unhandled `error` event and taken down the extension host.
+- `stop()` clears the cached port so a stopped server can no longer report a live endpoint.
+- Changing `cmsis-debugmcp.serverPort` now prompts to reload the window. Previously the setting silently had no effect until the next reload, while agent configs kept pointing at the old port.
+- **Spurious "Migrated N agent configuration(s)" toast on every activation.** The migration check treated any `type: 'http'` entry as legacy, but `http` is the *correct* transport for GitHub Copilot CLI (and now Claude Code) — those entries were rewritten and re-announced on every startup. Migration now only fires when the existing transport differs from the one the agent should use.
+- **Config files are never clobbered on parse failure.** Previously an unparseable agent config was silently replaced with a fresh object — catastrophic for `~/.claude.json`, which holds session history and settings beyond MCP entries. Configuration now aborts with an error message instead. All config writes go through a temp-file + rename so a crash mid-write can't truncate the file.
+- **Stale endpoint refresh.** When the server starts on an OS-assigned fallback port, existing agent config entries pointing at the old port are silently updated on activation instead of being left dead.
+- Removed dead code left over from the pre-stateless transport design (`isServerRunning()`, the unused `transports` map) and consolidated the four hardcoded version strings onto `SERVER_VERSION`.
+- Packaged `.vsix` shrinks from 29.5 MB to 14.6 MB — the 15 MB demo video was being shipped to every user despite being referenced only from the GitHub repo.
+
 ## [1.1.9] - 2026-05-19
 
 ### Fixed

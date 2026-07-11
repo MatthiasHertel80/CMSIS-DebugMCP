@@ -9,3 +9,6 @@ vsc-extension-quickstart.md
 **/*.map
 **/*.ts
 **/.vscode-test.*
+# 15 MB demo video: referenced from the GitHub repo, never by the packaged
+# extension or the marketplace readme. No reason to ship it to every user.
+assets/DebugMCP.mp4
