@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-07-11
+
+### Fixed
+- **`cmsis_action build` (and `load` / `erase` / `load_and_run`) now return a terminal result instead of leaving the agent idling.** These actions were fire-and-return: the tool kicked off the `cmsis-csolution.*` command and immediately replied "issued — check the CMSIS output channel for build/flash progress." An agent has no tool to read a VS Code output channel and no completion signal, so it would wait indefinitely — in practice polling for an output artifact file that the tool never promised. The handler now listens for the cbuild/flash **VS Code task** and returns the real outcome from its process exit code: `✅ succeeded (exit 0)` with the suggested next step, or `❌ FAILED (exit N)` pointing at the compiler/linker errors to fix. If no task runs within the window it reports "nothing to build / picker open"; if the task is still running at the deadline it says so — every path is terminal and explicitly tells the agent **not** to wait for a file. `build`/`load`/`erase`/`load_and_run` now default to the full 60 s handler budget (they run a real build), while `load_and_debug` / `attach` keep their fast hand-off to `get_session_status` polling.
+
+### Changed
+- The `cmsis_action` tool description now states that build/flash actions return a terminal exit-code result, so the agent stops trying to poll for build completion.
+
 ## [1.2.0] - 2026-07-11
 
 ### Added

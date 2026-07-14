@@ -1283,7 +1283,17 @@ REQUIRED NEXT STEPS:
      * the currently active csolution context (no arguments).
      */
     public async handleCmsisCommand(args: { action: CmsisAction; timeoutMs?: number }): Promise<string> {
-        return withHandlerTimeout('cmsis_action', args.timeoutMs, async () => {
+        // build / load / erase / load_and_run run a cbuild/flash task that can
+        // take tens of seconds. Give them the full handler budget by default
+        // so the tool can wait for the task's real exit code and return a
+        // terminal success/failure, rather than returning "issued" and
+        // leaving the agent to guess (or idle) when the build is done.
+        const runsBuildTask = args.action === 'build' || args.action === 'load'
+            || args.action === 'erase' || args.action === 'load_and_run';
+        const effectiveTimeoutMs = (args.timeoutMs && args.timeoutMs > 0)
+            ? args.timeoutMs
+            : (runsBuildTask ? HARD_HANDLER_CAP_MS : DEFAULT_HANDLER_TIMEOUT_MS);
+        return withHandlerTimeout('cmsis_action', effectiveTimeoutMs, async () => {
             // Pre-check: refuse to flash+attach on top of an already-active session.
             if ((args.action === 'load_and_debug' || args.action === 'attach') && this.executor.hasDebugSession()) {
                 const status = await this.executor.getSessionStatus();
@@ -1320,16 +1330,21 @@ REQUIRED NEXT STEPS:
                 throw new Error(`Unknown CMSIS action: ${args.action}`);
             }
 
-            // FIRE-AND-RETURN model. `cmsis-csolution.*` commands run a long
-            // build/flash/launch pipeline — clicking the panel's Debug button
-            // returns instantly and shows progress separately, and this tool
-            // does the same. We do NOT block the tool call for the 20-40 s a
-            // multi-core flash+attach takes. The command is kicked off and we
-            // do a SHORT opportunistic check; the agent then polls
-            // get_session_status (per the PHASE 1 workflow) to know when the
-            // session is ready. `executeCommand` is not awaited to completion
-            // because a CMSIS QuickPick (select context / debugger) would
-            // otherwise hang the call on a UI interaction the agent can't make.
+            // For build/flash actions, start listening for the cbuild/flash
+            // TASK to finish *before* we issue the command — its exit code is
+            // the one reliable "build done" signal, and a fast task could end
+            // before we start waiting otherwise. Session actions and the
+            // instant control ops (detach/stop_run) don't produce a task we
+            // wait on, so this stays idle for them.
+            const taskWaiter = runsBuildTask
+                ? this.waitForCmsisTaskResult(Math.max(5_000, effectiveTimeoutMs - 3_000))
+                : null;
+
+            // Session actions still use FIRE-AND-RETURN: `cmsis-csolution.*`
+            // launch commands run a long flash+attach pipeline, and awaiting
+            // `executeCommand` to completion can hang on a CMSIS QuickPick
+            // (select context / debugger) the agent can't answer. Those do a
+            // short opportunistic check and hand off to get_session_status.
             let commandFailed: string | null = null;
             const commandPromise = (vscode.commands.executeCommand(cmd) as Promise<unknown>)
                 .catch((error) => {
@@ -1400,9 +1415,114 @@ REQUIRED NEXT STEPS:
                     `different VS Code window than this MCP server.`;
             }
 
-            // build / load / erase / load_and_run / detach / stop_run — no session expected.
+            // build / load / erase / load_and_run — wait for the cbuild/flash
+            // TASK to finish and report its real exit code. This is the fix
+            // for the agent idling: we return a terminal success/failure, not
+            // "issued — check the output channel" (which the agent cannot read
+            // and would wait on forever).
+            if (taskWaiter) {
+                const nextStep: Record<string, string> = {
+                    build:        ' The firmware is built — use cmsis_action load or load_and_debug to flash it.',
+                    load:         ' Firmware flashed. Use cmsis_action attach or load_and_debug to start a debug session.',
+                    erase:        ' Target flash erased.',
+                    load_and_run: ' Firmware flashed and running (no debug session).',
+                };
+                const outcome = await taskWaiter;
+
+                if (outcome.done && outcome.exitCode === 0) {
+                    return `✅ CMSIS '${args.action}' succeeded (task '${outcome.taskName}' exited 0).` +
+                        (nextStep[args.action] ?? '');
+                }
+                if (outcome.done && typeof outcome.exitCode === 'number') {
+                    return `❌ CMSIS '${args.action}' FAILED — task '${outcome.taskName}' exited with code ` +
+                        `${outcome.exitCode}. Open the CMSIS/cbuild terminal or the Problems panel to read the ` +
+                        `compiler/linker errors, fix them in the source, then re-run cmsis_action ${args.action}. ` +
+                        `This is a terminal result — do not wait for an output file.`;
+                }
+                if (outcome.done) {
+                    // Task ended but the platform reported no exit code (e.g. it
+                    // was cancelled) — don't claim success.
+                    return `CMSIS '${args.action}' task '${outcome.taskName}' ended without an exit code ` +
+                        `(it may have been cancelled). Re-run cmsis_action ${args.action} to get a definite result.`;
+                }
+                if (!outcome.started) {
+                    // No cbuild/flash task ever started. Usually means the
+                    // active context is already up to date (nothing to build),
+                    // or the CMSIS panel is waiting on a manual picker.
+                    return `CMSIS '${args.action}' issued via '${cmd}', but no cbuild/flash task ran within the ` +
+                        `wait window. This usually means the active context is already up to date (nothing to ` +
+                        `${args.action}), or the CMSIS Solution panel is showing a picker that needs manual ` +
+                        `selection. This is a terminal result — do not wait for an output file. Re-run the ` +
+                        `action or check the CMSIS panel.`;
+                }
+                // Task started but is still running at the deadline.
+                const waitedS = Math.round((Math.max(5_000, effectiveTimeoutMs - 3_000)) / 1000);
+                return `CMSIS '${args.action}' is still running after ${waitedS}s (task '${outcome.taskName ?? cmd}' ` +
+                    `has not finished). Large clean builds can take longer than this. The tool returned so you are ` +
+                    `not blocked — re-run cmsis_action ${args.action} to get the final exit status, or watch the ` +
+                    `CMSIS terminal. Do NOT poll for an output file.`;
+            }
+
+            // detach / stop_run — instant control ops, nothing to wait on.
             return `CMSIS '${args.action}' command '${cmd}' issued. It runs in the CMSIS extension — ` +
-                `check the CMSIS output channel for build/flash progress.`;
+                `check the CMSIS output channel if you need to confirm.`;
+        });
+    }
+
+    /**
+     * Wait for the cbuild/flash VS Code task kicked off by a cmsis_action to
+     * finish, and surface its process exit code.
+     *
+     * `vscode.tasks.onDidEndTaskProcess` is the only reliable "the build is
+     * done" signal available to the extension — it carries the child
+     * process's exit code (0 = success). The alternatives are all worse: the
+     * `cmsis-csolution.*` command promise does not reliably resolve on task
+     * completion, and watching for an output artifact file to appear is
+     * exactly the guess that leaves the agent idling.
+     *
+     * Resolves as soon as a matching task ends. On timeout, `started` tells
+     * the caller whether a task ever ran (so it can distinguish "still
+     * building" from "nothing to build / picker open").
+     */
+    private waitForCmsisTaskResult(
+        timeoutMs: number,
+    ): Promise<{ done: boolean; started: boolean; exitCode?: number; taskName?: string }> {
+        return new Promise((resolve) => {
+            let settled = false;
+            let started = false;
+            let startedTaskName: string | undefined;
+            const disposables: vscode.Disposable[] = [];
+
+            const finish = (result: { done: boolean; started: boolean; exitCode?: number; taskName?: string }) => {
+                if (settled) { return; }
+                settled = true;
+                clearTimeout(timer);
+                for (const d of disposables) {
+                    try { d.dispose(); } catch { /* ignore */ }
+                }
+                resolve(result);
+            };
+
+            const isCmsisTask = (task: vscode.Task | undefined): boolean => {
+                if (!task) { return false; }
+                const haystack = `${task.name ?? ''} ${typeof task.source === 'string' ? task.source : ''} ` +
+                    `${task.definition?.type ?? ''}`.toLowerCase();
+                return /cmsis|cbuild/.test(haystack);
+            };
+
+            const timer = setTimeout(() => finish({ done: false, started, taskName: startedTaskName }), timeoutMs);
+
+            disposables.push(vscode.tasks.onDidStartTaskProcess((e) => {
+                if (isCmsisTask(e.execution.task)) {
+                    started = true;
+                    startedTaskName = e.execution.task.name;
+                }
+            }));
+            disposables.push(vscode.tasks.onDidEndTaskProcess((e) => {
+                if (isCmsisTask(e.execution.task)) {
+                    finish({ done: true, started: true, exitCode: e.exitCode, taskName: e.execution.task.name });
+                }
+            }));
         });
     }
 

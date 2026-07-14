@@ -531,11 +531,15 @@ export class DebugMCPServer {
                 'currently active csolution context (the one selected in the panel).\n\n' +
                 'For embedded debug, ALWAYS choose cmsis_action over start_debugging — start_debugging uses the ' +
                 'plain VS Code debug tab and skips the build / flash pipeline that CMSIS Solution orchestrates.\n\n' +
+                'build / load / erase / load_and_run WAIT for the cbuild/flash task to finish and return a ' +
+                'terminal ✅ success / ❌ failure with the task exit code. On failure, read the errors and fix ' +
+                'the source — do NOT poll for an output file or call get_session_status. load_and_debug / attach ' +
+                'return quickly and hand off to get_session_status polling.\n' +
                 'Actions:\n' +
-                '  • build           — build the active context\n' +
-                '  • load            — flash download to the target\n' +
-                '  • erase           — erase target flash\n' +
-                '  • load_and_run    — flash and run (no debug session)\n' +
+                '  • build           — build the active context. Returns the build result (exit code).\n' +
+                '  • load            — flash download to the target. Returns the flash result.\n' +
+                '  • erase           — erase target flash. Returns the result.\n' +
+                '  • load_and_run    — flash and run (no debug session). Returns the result.\n' +
                 '  • load_and_debug  — flash and start a debug session (the "Debug" button). Waits for the session to be ready.\n' +
                 '  • attach          — attach debugger to an already-flashed target (skips programming). Waits for the session to be ready.\n' +
                 '  • detach          — detach debugger\n' +
