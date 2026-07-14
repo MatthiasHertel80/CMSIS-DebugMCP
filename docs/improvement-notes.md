@@ -42,10 +42,7 @@ DebugMCP. This is a living document — keep it in sync as items ship.
   returns its exit code. Still want bytes-programmed / structured flash error.)*
 - `start_debugging` with a launch config that has a `CMSIS Load` preLaunchTask
   failed opaquely; the attach config cannot flash at all.
-- Suggestion: a `flash` tool that takes the cbuild-run file (or resolves the
-  active CMSIS context), programs via pyOCD/J-Link, and returns bytes
-  programmed / error synchronously — exactly what `pyocd load --cbuild-run`
-  provides.
+- Suggestion: develop a status channel for flash programming
 
 ### 2. GDB server lifecycle (bypassed with manual `JLinkGDBServerCL ...`)
 - When the VS Code launch pipeline fails to spawn the server (renderer error
