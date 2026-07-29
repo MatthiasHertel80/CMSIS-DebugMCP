@@ -4,6 +4,7 @@ import * as vscode from 'vscode';
 import { DebugMCPServer } from './debugMCPServer';
 import { SERVER_VERSION } from './debuggingExecutor';
 import { AgentConfigurationManager } from './utils/agentConfigurationManager';
+import { clearSvdCache } from './core/svdParser';
 import { logger, LogLevel } from './utils/logger';
 import { registerSessionStateTracker } from './utils/sessionStateTracker';
 
@@ -30,6 +31,13 @@ export async function activate(context: vscode.ExtensionContext) {
     // Track DAP stopped/continued events so we can answer "is the target
     // currently paused?" reliably, regardless of what activeStackItem says.
     registerSessionStateTracker(context);
+
+    // Drop the parsed-SVD cache when a debug session ends — the next session
+    // may target a different device, and the module-level cache in svdParser
+    // has no other invalidation path.
+    context.subscriptions.push(
+        vscode.debug.onDidTerminateDebugSession(() => clearSvdCache()),
+    );
 
     // Initialize Agent Configuration Manager
     agentConfigManager = new AgentConfigurationManager(context, timeoutInSeconds, serverPort);

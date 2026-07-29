@@ -329,8 +329,15 @@ export function listPeripheralNames(device: SvdDevice): string[] {
  */
 export function decodeFields(register: SvdRegister, value: number): { name: string; value: number; bits: string; description?: string }[] {
     return register.fields.map(f => {
-        const mask = ((1 << (f.bitHigh - f.bitLow + 1)) - 1) << f.bitLow;
-        const fieldValue = (value & mask) >>> f.bitLow;
+        // JS bitwise ops coerce to int32 and `1 << 32` wraps to 1, so a
+        // full-word field ([31:0]) needs the >= 32 path explicitly. Shift
+        // first (>>> is ToUint32) and mask with 2**width - 1 (exact for
+        // width <= 31) so no intermediate is ever a negative int32 and
+        // field values never print negative when bit 31 is set.
+        const width = f.bitHigh - f.bitLow + 1;
+        const fieldValue = width >= 32
+            ? value >>> 0
+            : ((value >>> f.bitLow) & (2 ** width - 1)) >>> 0;
         return {
             name: f.name,
             value: fieldValue,
