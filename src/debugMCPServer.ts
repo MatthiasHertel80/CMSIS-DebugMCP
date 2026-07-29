@@ -226,6 +226,28 @@ export class DebugMCPServer {
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
+        // Reset tool — resets the target inside the live session, verified.
+        mcpServer.registerTool('reset', {
+            description: 'Reset the target via GDB monitor commands (pyOCD / J-Link) and VERIFY the reset actually took ' +
+                'effect — the PC is compared against the reset vector read from the vector table, and the result says ' +
+                'honestly when the target did NOT appear to reset (silent non-resets are common on attach configurations). ' +
+                'Unlike restart_debugging, the debug session and its breakpoints survive. A running target is halted ' +
+                'first. method: auto (system → core → hardware escalation, default), system (SYSRESETREQ), core ' +
+                '(VECTRESET), hardware (nSRST — requires the reset line wired from probe to target). halt=true (default) ' +
+                'leaves the target stopped at the reset vector; halt=false resumes after verification.',
+            annotations: { readOnlyHint: false, destructiveHint: true },
+            inputSchema: {
+                method: z.enum(['auto', 'system', 'core', 'hardware']).optional()
+                    .describe("Reset method. 'auto' (default) escalates system → core → hardware until one verifies."),
+                halt: z.boolean().optional()
+                    .describe('Leave the target halted at the reset vector (default true). false resumes after verification.'),
+                timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
+            },
+        }, async (args: { method?: 'auto' | 'system' | 'core' | 'hardware'; halt?: boolean; timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleReset(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
         // Add breakpoint tool
         mcpServer.registerTool('add_breakpoint', {
             description: 'Set a breakpoint to pause execution at a critical line of code. Essential for debugging: pause before potential errors, examine state at decision points, or verify code paths. Breakpoints let you inspect variables and control flow at exact moments.',

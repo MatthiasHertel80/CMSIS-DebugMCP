@@ -8,6 +8,10 @@ import {
     getLiveSessionCount, getLiveSessionNames,
     waitForStopEvent, StopWaitResult,
 } from './utils/sessionStateTracker';
+import {
+    buildResetCommands, detectGdbServerKind, replyLooksUnsupported,
+    GdbServerKind, ResetMethod,
+} from './core/resetAssist';
 import { logger } from './utils/logger';
 
 /**
@@ -65,6 +69,8 @@ export interface IDebuggingExecutor {
     getActiveSession(): vscode.DebugSession | undefined;
     readMemory(address: string, length: number, timeoutMs?: number): Promise<Buffer>;
     readMemoryWord(address: string, timeoutMs?: number): Promise<number>;
+    writeMemoryWord(address: string, value: number, timeoutMs?: number): Promise<void>;
+    resetTarget(options: { method?: 'auto' | ResetMethod; halt?: boolean; timeoutMs?: number }): Promise<ResetOutcome>;
     readCoreRegisters(timeoutMs?: number): Promise<Record<string, string>>;
     readPeripheralRegister(peripheral: string, register?: string, timeoutMs?: number): Promise<string>;
     getFaultInfo(timeoutMs?: number): Promise<string>;
@@ -82,6 +88,24 @@ export interface DapThread {
     id: number;
     name: string;
     topFrame?: StackFrame;
+}
+
+/** Result of a verified target reset — see resetTarget(). */
+export interface ResetOutcome {
+    /** GDB server detected behind the session (drives the monitor-command dialect). */
+    serverKind: GdbServerKind;
+    /** Reset methods attempted, in order ('auto' escalates on failed verification). */
+    methodsTried: ResetMethod[];
+    /** Monitor commands sent, in order. */
+    commandsIssued: string[];
+    /** Raw adapter replies, one per issued command. */
+    replies: string[];
+    /** True only when PC was confirmed at the reset vector afterwards. */
+    verified: boolean;
+    /** Human-readable verification evidence (PC vs reset vector, or why it could not be checked). */
+    verificationDetail: string;
+    /** True when the target was running and we halted it to issue the reset. */
+    haltedByUs: boolean;
 }
 
 /** Low-level diagnostics for telling a stale build / wrong-window apart from a genuine no-session. */
@@ -971,6 +995,178 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             ? parseInt(trimmed, 16)
             : parseInt(trimmed, 10);
         return isNaN(val) ? null : val;
+    }
+
+    /**
+     * Write a single 32-bit word to target memory (little-endian) and verify
+     * it stuck. DAP `writeMemory` first; falls back to GDB `set` via the REPL
+     * for adapters without it. The read-back is not optional — a silently
+     * dropped write is exactly how "reset did nothing" happens in the field.
+     * (Caveat: genuinely write-only registers would false-fail the read-back;
+     * AIRCR/DEMCR/DWT_CTRL — the registers this exists for — are all readable.)
+     */
+    public async writeMemoryWord(address: string, value: number, timeoutMs?: number): Promise<void> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+
+        const addr = address.startsWith('0x') || address.startsWith('0X') ? address : `0x${address}`;
+        const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
+
+        const buf = Buffer.alloc(4);
+        buf.writeUInt32LE(value >>> 0, 0);
+        try {
+            await customRequestWithTimeout<any>(session, 'writeMemory', {
+                memoryReference: addr,
+                data: buf.toString('base64'),
+            }, dapMs);
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
+            await this.execGdbCommand(`set {unsigned int}${addr} = ${value >>> 0}`, dapMs);
+        }
+
+        const readBack = await this.readMemoryWord(addr, dapMs);
+        if ((readBack >>> 0) !== (value >>> 0)) {
+            throw new Error(
+                `Write to ${addr} did not stick (wrote 0x${(value >>> 0).toString(16).padStart(8, '0')}, ` +
+                `read back 0x${(readBack >>> 0).toString(16).padStart(8, '0')})`
+            );
+        }
+    }
+
+    /**
+     * Reset the target via GDB monitor commands and VERIFY the reset actually
+     * took effect. `restart_debugging` restarts the whole VS Code session;
+     * this resets the target inside the live session (breakpoints survive) —
+     * and reports honestly when the target did not appear to reset, because
+     * silent non-resets on attach configurations are a recurring field issue.
+     *
+     * Verification is PC-vs-reset-vector: after a halted reset the PC must
+     * equal the reset handler read from the vector table (VTOR-based, falling
+     * back to table base 0). 'auto' escalates system → core → hardware until
+     * one verifies. With halt=false the target is verified halted first, then
+     * resumed — the verification needs a stopped snapshot.
+     */
+    public async resetTarget(options: { method?: 'auto' | ResetMethod; halt?: boolean; timeoutMs?: number }): Promise<ResetOutcome> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+        const leaveHalted = options.halt !== false; // default true
+        const dapMs = capTimeout(options.timeoutMs, this.timeouts.dapRequestMs);
+
+        const config = session.configuration ?? {};
+        const outcome: ResetOutcome = {
+            serverKind: detectGdbServerKind(`${config.target?.server ?? ''} ${config.debugger?.name ?? ''} ${session.name}`),
+            methodsTried: [],
+            commandsIssued: [],
+            replies: [],
+            verified: false,
+            verificationDetail: 'not attempted',
+            haltedByUs: false,
+        };
+
+        // A reset must be issued from a halted state — halt a running target first.
+        if (!isSessionStopped(session)) {
+            await this.pause(dapMs);
+            const stop = await waitForStopEvent(session, 5_000);
+            if (stop.kind !== 'stopped') {
+                outcome.verificationDetail = 'could not halt the target to issue the reset (pause did not stop it within 5 s)';
+                return outcome;
+            }
+            outcome.haltedByUs = true;
+        }
+
+        const methods: ResetMethod[] = (!options.method || options.method === 'auto')
+            ? ['system', 'core', 'hardware']
+            : [options.method];
+
+        for (const method of methods) {
+            outcome.methodsTried.push(method);
+            // Always issue the halting form — the verification needs a stopped
+            // snapshot; a 'run'-mode reset would race the PC read. The target
+            // is resumed at the end when the caller asked for halt=false.
+            const commands = buildResetCommands(outcome.serverKind, method, true);
+            let unsupported = false;
+            for (const cmd of commands) {
+                outcome.commandsIssued.push(cmd);
+                const reply = await this.execGdbCommand(cmd, dapMs);
+                outcome.replies.push(reply.raw || '<no echo from adapter>');
+                if (replyLooksUnsupported(reply.raw)) { unsupported = true; }
+            }
+            if (unsupported) {
+                outcome.verificationDetail = `adapter did not recognize the ${method} reset command — trying the next method`;
+                continue;
+            }
+
+            // Most adapters emit a stopped event when the reset-halt lands;
+            // some don't. Wait briefly, then settle either way.
+            const stop = await waitForStopEvent(session, 3_000);
+            if (stop.kind === 'ended') {
+                outcome.verificationDetail = 'debug session ended during the reset';
+                return outcome;
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            const verification = await this.verifyResetViaVectorTable(dapMs);
+            outcome.verificationDetail = verification.detail;
+            if (verification.verified) {
+                outcome.verified = true;
+                break;
+            }
+        }
+
+        if (outcome.verified && !leaveHalted) {
+            await this.continue(dapMs);
+        }
+        return outcome;
+    }
+
+    /**
+     * Compare the live PC against the reset handler read from the vector
+     * table. The table base comes from VTOR (0xE000ED08, TBLOFF is bits 31:7)
+     * with a fallback to base 0 when VTOR reads as 0 or fails. All address
+     * math stays unsigned (>>> 0) — vector tables at 0x80000000+ are common
+     * (e.g. MRAM-aliased parts) and would go negative under int32 coercion.
+     */
+    private async verifyResetViaVectorTable(dapMs: number): Promise<{ verified: boolean; detail: string }> {
+        const hex = (n: number) => `0x${(n >>> 0).toString(16).padStart(8, '0')}`;
+        try {
+            let vectorBase = 0;
+            try {
+                const vtor = await this.readMemoryWord('0xE000ED08', dapMs);
+                if (vtor !== 0) { vectorBase = (vtor & 0xFFFFFF80) >>> 0; }
+            } catch {
+                // Fall back to table base 0 — pre-VTOR boot state or unreadable SCS.
+            }
+            const resetVector = ((await this.readMemoryWord(hex(vectorBase + 4), dapMs)) & 0xFFFFFFFE) >>> 0;
+            const pc = (await this.readProgramCounter(dapMs) & 0xFFFFFFFE) >>> 0;
+            const verified = pc === resetVector;
+            return {
+                verified,
+                detail: verified
+                    ? `PC=${hex(pc)} matches the reset vector (${hex(resetVector)}, vector table at ${hex(vectorBase)})`
+                    : `PC=${hex(pc)} does NOT match the reset vector ${hex(resetVector)} (vector table at ${hex(vectorBase)})`,
+            };
+        } catch (err) {
+            return { verified: false, detail: `verification reads failed: ${err instanceof Error ? err.message : String(err)}` };
+        }
+    }
+
+    /**
+     * Read the program counter via `$pc` evaluate, tolerating a symbol
+     * annotation in the reply ("0x080001a0 <Reset_Handler+4>").
+     */
+    private async readProgramCounter(dapMs: number): Promise<number> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+        const debugState = await this.getCurrentDebugState(0);
+        const frameOpt = debugState.frameId !== null ? { frameId: debugState.frameId } : {};
+        const response = await customRequestWithTimeout<any>(session, 'evaluate', {
+            expression: '$pc',
+            context: 'watch',
+            ...frameOpt,
+        }, dapMs);
+        const match = String(response?.result ?? '').match(/0x[0-9a-fA-F]+/);
+        if (!match) { throw new Error(`could not parse PC from '${response?.result ?? '<empty>'}'`); }
+        return parseInt(match[0], 16);
     }
 
     /**

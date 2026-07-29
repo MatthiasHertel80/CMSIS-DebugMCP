@@ -61,6 +61,7 @@ export interface IDebuggingHandler {
     handlePause(args?: { timeoutMs?: number }): Promise<string>;
     handleWaitForStop(args?: { timeoutMs?: number }): Promise<string>;
     handleRestart(args?: { timeoutMs?: number }): Promise<string>;
+    handleReset(args: { method?: 'auto' | 'system' | 'core' | 'hardware'; halt?: boolean; timeoutMs?: number }): Promise<string>;
     handleAddBreakpoint(args: { fileFullPath: string; lineContent: string }): Promise<string>;
     handleRemoveBreakpoint(args: { fileFullPath: string; line: number }): Promise<string>;
     handleClearAllBreakpoints(): Promise<string>;
@@ -463,6 +464,41 @@ export class DebuggingHandler implements IDebuggingHandler {
         } catch (error) {
             throw new Error(`Error restarting debug session: ${error}`);
         }
+    }
+
+    /**
+     * Reset the target inside the live session and verify the reset took
+     * effect (PC compared against the reset vector). Unlike restart_debugging
+     * the debug session and its breakpoints survive. Reports honestly when
+     * the target did not appear to reset — silent non-resets are common on
+     * attach configurations.
+     */
+    public async handleReset(args: { method?: 'auto' | 'system' | 'core' | 'hardware'; halt?: boolean; timeoutMs?: number }): Promise<string> {
+        return withHandlerTimeout('reset', args?.timeoutMs, async () => {
+            if (!this.executor.hasDebugSession()) {
+                throw new Error('No active debug session. Start debugging first — reset drives the target through the live probe.');
+            }
+            const outcome = await this.executor.resetTarget({
+                method: args?.method ?? 'auto',
+                halt: args?.halt,
+                timeoutMs: args?.timeoutMs,
+            });
+            const commandsLine = outcome.commandsIssued.length > 0
+                ? ` Commands: ${outcome.commandsIssued.map(c => `'${c}'`).join(', ')} (server: ${outcome.serverKind}).`
+                : '';
+            if (outcome.verified) {
+                const next = args?.halt === false
+                    ? ' Target resumed (halt=false).'
+                    : ' Target is halted at the reset vector — use continue_execution to run.';
+                return `Target reset verified. ${outcome.verificationDetail}. ` +
+                    `Method(s) tried: ${outcome.methodsTried.join(', ')}.${commandsLine}${next}`;
+            }
+            return `⚠️ Reset was issued but the target does NOT appear to have reset. ${outcome.verificationDetail}. ` +
+                `Method(s) tried: ${outcome.methodsTried.join(', ')}.${commandsLine} ` +
+                `'hardware' requires nSRST wired from probe to target — if it is not connected, no software reset can ` +
+                `recover this; power-cycle the board or reconnect the probe. ` +
+                `Adapter replies: ${outcome.replies.join(' | ') || '<none>'}`;
+        });
     }
 
     /**
