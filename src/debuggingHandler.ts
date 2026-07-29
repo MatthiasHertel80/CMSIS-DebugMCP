@@ -58,6 +58,7 @@ export interface IDebuggingHandler {
     handleStepOut(args?: { timeoutMs?: number }): Promise<string>;
     handleContinue(args?: { timeoutMs?: number }): Promise<string>;
     handlePause(args?: { timeoutMs?: number }): Promise<string>;
+    handleWaitForStop(args?: { timeoutMs?: number }): Promise<string>;
     handleRestart(args?: { timeoutMs?: number }): Promise<string>;
     handleAddBreakpoint(args: { fileFullPath: string; lineContent: string }): Promise<string>;
     handleRemoveBreakpoint(args: { fileFullPath: string; line: number }): Promise<string>;
@@ -379,6 +380,46 @@ export class DebuggingHandler implements IDebuggingHandler {
             return `Pause requested but the debug session ended. The target may have crashed.`;
         }
         return `Target paused. ${result.state.toString()}`;
+    }
+
+    /**
+     * Block until the target next stops (breakpoint, fault, step-complete,
+     * pause) and return the stop reason plus the current debug state, or a
+     * structured timeout. Use after continue_execution returned while the
+     * target was still running, after issuing execution through
+     * evaluate_expression ("-exec continue"), or to catch the first
+     * breakpoint of a free-running session — this replaces blind sleeping.
+     * Issues no execution commands itself.
+     */
+    public async handleWaitForStop(args?: { timeoutMs?: number }): Promise<string> {
+        return withHandlerTimeout('wait_for_stop', args?.timeoutMs, async () => {
+            if (!this.executor.hasDebugSession()) {
+                throw new Error('No active debug session. Start debugging first — wait_for_stop waits on a live session.');
+            }
+            // Leave a margin under the handler fence so the structured
+            // timeout text wins over the generic fence message when both
+            // would fire at the same deadline.
+            const budget = args?.timeoutMs ? Math.max(args.timeoutMs - 1_500, 100) : 28_500;
+            const result = await this.executor.waitForStop(budget);
+            if (result.kind === 'timeout') {
+                return 'Target did not stop within the timeout — it is still running (or the probe is unresponsive). ' +
+                    'Options: call wait_for_stop again with a larger timeoutMs, pause_execution to see where it is, ' +
+                    'or check_target_connection if other calls are also stalling.';
+            }
+            if (result.kind === 'ended') {
+                return 'The debug session ended while waiting for a stop — the target may have crashed, the probe ' +
+                    'disconnected, or the session was stopped in the UI. Call get_session_status to confirm.';
+            }
+            // Let VS Code surface the new frame before snapshotting (same
+            // settle delay waitForTargetStopped uses).
+            await new Promise(resolve => setTimeout(resolve, this.executionDelay));
+            const state = await this.executor.getCurrentDebugState(this.numNextLines);
+            const threadInfo = result.kind === 'stopped' && result.threadId !== null ? `, threadId=${result.threadId}` : '';
+            const head = result.kind === 'already-stopped'
+                ? `Target was already stopped (reason: ${result.reason ?? 'unknown'}).`
+                : `Target stopped (reason: ${result.reason ?? 'unknown'}${threadInfo}).`;
+            return `${head}\n\n${state.toString()}`;
+        });
     }
 
     /**

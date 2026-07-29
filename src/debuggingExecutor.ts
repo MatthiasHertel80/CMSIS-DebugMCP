@@ -6,6 +6,7 @@ import { customRequestWithTimeout, HardwareTimeoutError, withTimeout } from './u
 import {
     isSessionStopped, getStoppedReason, resolveActiveSession,
     getLiveSessionCount, getLiveSessionNames,
+    waitForStopEvent, StopWaitResult,
 } from './utils/sessionStateTracker';
 import { logger } from './utils/logger';
 
@@ -48,6 +49,7 @@ export interface IDebuggingExecutor {
     stepOut(timeoutMs?: number): Promise<void>;
     continue(timeoutMs?: number): Promise<void>;
     pause(timeoutMs?: number): Promise<void>;
+    waitForStop(timeoutMs?: number): Promise<StopWaitResult | { kind: 'already-stopped'; reason: string | null }>;
     restart(): Promise<void>;
     addBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
     removeBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
@@ -301,6 +303,22 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             // Fallback to UI command for non-timeout failures
             await vscode.commands.executeCommand('workbench.action.debug.pause');
         }
+    }
+
+    /**
+     * Block until the target next stops (breakpoint, fault, step-complete,
+     * pause) and report the stop reason, or until the timeout / session end.
+     * If the target is already stopped the agent's question is answered —
+     * return the recorded reason rather than waiting for a *future* event.
+     * Issues no execution commands itself.
+     */
+    public async waitForStop(timeoutMs?: number): Promise<StopWaitResult | { kind: 'already-stopped'; reason: string | null }> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+        if (isSessionStopped(session)) {
+            return { kind: 'already-stopped' as const, reason: getStoppedReason(session) };
+        }
+        return waitForStopEvent(session, capTimeout(timeoutMs, HARD_CALL_CAP_MS));
     }
 
     /**

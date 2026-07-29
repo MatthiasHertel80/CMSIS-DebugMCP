@@ -202,6 +202,21 @@ export class DebugMCPServer {
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
+        // Wait-for-stop tool — blocks until the target next stops, without
+        // issuing any execution command itself.
+        mcpServer.registerTool('wait_for_stop', {
+            description: 'Block until the target next stops (breakpoint, fault, step-complete, pause) and return the stop ' +
+                'reason plus the current debug state, or a structured timeout. Use after continue_execution returned while ' +
+                'the target was still running, after issuing execution through evaluate_expression ("-exec continue"), or to ' +
+                'catch the first breakpoint of a free-running session — this replaces blind sleeping. Returns immediately ' +
+                'with the recorded reason if the target is already stopped. Issues no execution commands itself.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleWaitForStop(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
         // Restart debugging tool
         mcpServer.registerTool('restart_debugging', {
             description: 'Restart the debug session from the beginning with the same configuration.',
