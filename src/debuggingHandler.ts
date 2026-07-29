@@ -1,10 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 
 import * as vscode from 'vscode';
+import * as path from 'path';
+import * as jsonc from 'jsonc-parser';
 import { IDebugConfigurationManager } from './utils/debugConfigurationManager';
 import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { HardwareTimeoutError, withTimeout } from './utils/timeout';
+import { fileExists, flashWithPyocd, probePyocd } from './core/flashController';
 import { getRecentDiagnostics } from './utils/sessionStateTracker';
 import { logger } from './utils/logger';
 
@@ -80,6 +83,7 @@ export interface IDebuggingHandler {
     handleGetThreads(args?: { timeoutMs?: number }): Promise<string>;
     handleGetFrameVariables(args: { frameId: number; scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string>;
     handleCmsisCommand(args: { action: CmsisAction; timeoutMs?: number }): Promise<string>;
+    handleFlash(args: { cbuildRunFile?: string; timeoutMs?: number }): Promise<string>;
 }
 
 export type CmsisAction =
@@ -1395,6 +1399,101 @@ REQUIRED NEXT STEPS:
             return { stable: true, detail: `${first.detail}, ${second.detail} — target threads present` };
         }
         return { stable: false, detail: `${first.detail}, then ${second.detail}` };
+    }
+
+    /**
+     * Program the target flash via `pyocd load --cbuild-run` as a synchronous
+     * operation: bytes programmed + structured error, not "check the output
+     * channel". Refuses while a debug session is active — programming under
+     * a live session wedges most probes.
+     */
+    public async handleFlash(args: { cbuildRunFile?: string; timeoutMs?: number }): Promise<string> {
+        // Flash legitimately takes tens of seconds — default to the full
+        // budget like cmsis_action build/load does.
+        return withHandlerTimeout('flash', args?.timeoutMs ?? HARD_HANDLER_CAP_MS, async () => {
+            if (this.executor.hasDebugSession()) {
+                return 'Refusing to flash while a debug session is active — programming under a live session ' +
+                    'wedges most probes. Call stop_debugging first, then flash, then cmsis_action attach or load_and_debug.';
+            }
+            const resolved = await this.resolveCbuildRunFile(args.cbuildRunFile);
+            if ('error' in resolved) { return resolved.error; }
+            const version = await probePyocd();
+            if (!version) {
+                return 'pyocd not found on PATH. Install it (pip install pyocd / pipx install pyocd), or use ' +
+                    'cmsis_action load, which drives the CMSIS Solution extension\'s own flash pipeline.';
+            }
+            // Margin under the handler fence so the flash result (not the
+            // generic fence text) is what the agent sees at the deadline.
+            const budget = Math.max((args?.timeoutMs ?? HARD_HANDLER_CAP_MS) - 1_500, 1_000);
+            const result = await flashWithPyocd(resolved.path, budget);
+            if (result.timedOut) {
+                return `Flash timed out after ${Math.round(budget / 1000)} s — the pyOCD process was killed.\n` +
+                    `Output tail:\n  ${result.outputTail.join('\n  ') || '<no output>'}\n` +
+                    `Retry, or investigate why programming stalls (probe connection, target held in reset).`;
+            }
+            if (result.ok) {
+                const bytes = result.programmedBytes !== null ? ` — programmed ${result.programmedBytes} bytes` : '';
+                const rate = result.kbps !== null ? ` at ${result.kbps} kB/s` : '';
+                return `✅ Flash succeeded${bytes}${rate} (pyOCD ${version}: \`${result.commandLine}\`). ` +
+                    `Use cmsis_action attach or load_and_debug to start a debug session.`;
+            }
+            return `❌ Flash FAILED (exit ${result.exitCode ?? 'unknown'}) — \`${result.commandLine}\`\n` +
+                (result.errorLines.length > 0 ? `Errors:\n  ${result.errorLines.join('\n  ')}\n` : '') +
+                `Output tail:\n  ${result.outputTail.join('\n  ') || '<no output>'}\n` +
+                `This is a terminal result — fix the cause and re-run flash.`;
+        });
+    }
+
+    /**
+     * Resolve the cbuild-run.yml to program: the explicit argument, else the
+     * active launch.json's `cmsis.cbuildRunFile` (${command:...} references
+     * cannot be resolved here and are skipped, same as the SVD resolver),
+     * else a recursive out/ scan (cbuild-run files nest as
+     * out/<project>/<target>/<build>/). Ambiguity is an error that names the
+     * candidates, never a silent pick.
+     */
+    private async resolveCbuildRunFile(explicit?: string): Promise<{ path: string } | { error: string }> {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (explicit) {
+            const resolved = path.isAbsolute(explicit)
+                ? explicit
+                : (workspaceFolder ? path.join(workspaceFolder.uri.fsPath, explicit) : explicit);
+            if (!fileExists(resolved)) {
+                return { error: `cbuild-run file not found: ${resolved}. Pass an existing path, or omit ` +
+                    `cbuildRunFile to auto-resolve from launch.json / out/.` };
+            }
+            return { path: resolved };
+        }
+        if (!workspaceFolder) {
+            return { error: 'No workspace folder open and no cbuildRunFile argument given — cannot resolve what to flash.' };
+        }
+
+        try {
+            const launchJsonPath = vscode.Uri.joinPath(workspaceFolder.uri, '.vscode', 'launch.json');
+            const doc = await vscode.workspace.openTextDocument(launchJsonPath);
+            const launchConfig = jsonc.parse(doc.getText());
+            const configs: any[] = Array.isArray(launchConfig?.configurations) ? launchConfig.configurations : [];
+            for (const config of configs) {
+                const candidate = config?.cmsis?.cbuildRunFile;
+                if (typeof candidate === 'string' && candidate.length > 0 && !candidate.includes('${command:')) {
+                    const resolved = path.isAbsolute(candidate) ? candidate : path.join(workspaceFolder.uri.fsPath, candidate);
+                    if (fileExists(resolved)) { return { path: resolved }; }
+                }
+            }
+        } catch {
+            // No launch.json or unparseable — fall through to the out/ scan.
+        }
+
+        const matches = await vscode.workspace.findFiles('out/**/*.cbuild-run.yml', '**/node_modules/**', 10);
+        if (matches.length === 1) {
+            return { path: matches[0].fsPath };
+        }
+        if (matches.length > 1) {
+            return { error: `Found ${matches.length} cbuild-run files under out/ — pass cbuildRunFile explicitly:\n` +
+                `  ${matches.map(m => m.fsPath).join('\n  ')}` };
+        }
+        return { error: 'No cbuild-run file found (launch.json has no resolvable cmsis.cbuildRunFile and out/ has ' +
+            'none). Build first (cmsis_action build), or pass cbuildRunFile explicitly.' };
     }
 
     /**

@@ -608,6 +608,29 @@ export class DebugMCPServer {
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
+        // Flash tool — programs the target via `pyocd load --cbuild-run` and
+        // returns bytes programmed / structured error synchronously.
+        mcpServer.registerTool('flash', {
+            description: 'Program the target flash via `pyocd load --cbuild-run` and return a synchronous result: ' +
+                'bytes programmed + rate on success, or the exit code with the pyOCD error/output tail on failure. ' +
+                'Programs ALL images listed under `output:` in the cbuild-run file (multi-core safe). ' +
+                'REFUSES while a debug session is active (programming under a live session wedges most probes) — ' +
+                'stop_debugging first, then flash, then cmsis_action attach or load_and_debug. ' +
+                'The cbuild-run file is auto-resolved from the active launch.json / out/ when cbuildRunFile is omitted. ' +
+                'Requires pyocd on PATH (pip install pyocd); cmsis_action load is the alternative that uses the CMSIS ' +
+                'extension\'s bundled flash pipeline.',
+            annotations: { readOnlyHint: false, destructiveHint: true },
+            inputSchema: {
+                cbuildRunFile: z.string().optional()
+                    .describe('Path to the .cbuild-run.yml to program. Omit to auto-resolve from launch.json / out/.'),
+                timeoutMs: z.number().int().min(1_000).max(60_000).optional()
+                    .describe(TIMEOUT_DESC + ' Flash defaults to the full 60 s budget.'),
+            },
+        }, async (args: { cbuildRunFile?: string; timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleFlash(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
         // Get session status tool
         mcpServer.registerTool('get_session_status', {
             description: 'Report the current debug-session state in one of five categories: ' +
