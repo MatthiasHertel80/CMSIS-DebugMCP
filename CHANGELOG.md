@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and this
 
 ## [Unreleased]
 
+### Added
+- **`wait_for_stop` tool** — block until the target next stops (breakpoint, fault, step-complete, pause) and return the stop reason plus the current debug state, or a structured timeout. Built on raw DAP `stopped` events from the session tracker (the ground truth), not VS Code UI events. Returns immediately with the recorded reason when the target is already stopped. This replaces sleeping blind after `continue_execution` returned while the target was still running — the pattern that once missed a 15 s playback window.
+- **`reset` tool** — reset the target inside the live session (breakpoints and session survive, unlike `restart_debugging`) via GDB monitor commands, and **verify the reset actually took effect**: after the reset-halt the PC must equal the reset handler read from the vector table (VTOR-based, falling back to table base 0). `method: auto` escalates `system` → `core` → `hardware` until one verifies; adapter replies that read like "unknown command" escalate instead of being trusted. Unverified resets are reported honestly ("target does NOT appear to have reset", with the adapter replies and the nSRST wiring caveat) — silent non-resets on attach configurations were a recurring field issue.
+- **`read_cycle_counter` tool** — DWT CYCCNT for cycle-accurate timing: enables `DEMCR.TRCENA` and `DWT_CTRL.CYCCNTENA` when needed, reports `NOCYCCNT` cores honestly, and prints the wrap (~10.7 s @ 400 MHz), core-halt, and WFE-sleep caveats with the two-point delta recipe.
+- **`flash` tool** — `pyocd load --cbuild-run <file>` as a synchronous operation: bytes programmed + rate on success, exit code + pyOCD error/output tail on failure. The cbuild-run file is auto-resolved from launch.json's `cmsis.cbuildRunFile` or a recursive `out/` scan; ambiguity is an error naming the candidates, never a silent pick. Refuses while a debug session is active (programming under a live session wedges most probes). Requires pyocd on PATH; `cmsis_action load` remains the bundled-pipeline alternative.
+- **Launch-failure diagnostics passthrough.** The session tracker now keeps a bounded per-session ring of recent adapter traffic (failed DAP responses, adapter stderr/console output — `stdout` excluded so target printf can't flush real errors out). `start_debugging` failures and the `cmsis_action load_and_debug` / `attach` "did NOT survive the initial connect" report append it, instead of leaving the real cause in the extension-host log.
+
+### Fixed
+- **`read_peripheral_register` decoded full-word SVD fields as 0.** `decodeFields()` built its mask as `((1 << width) - 1) << bitLow`, but JS bitwise ops coerce to int32: `1 << 32` wraps to 1, so any `[31:0]` field got mask 0 and silently decoded to `0x0` for every register value; width-31 fields were corrupted by the negative `(1 << 31) - 1`, and fields touching bit 31 could print negative. The decode now shifts first (`>>>` is ToUint32) and masks with `2**width - 1` (exact for width ≤ 31), so no intermediate is ever a negative int32. Covered by new unit tests (widths 1/8/31/32, high-bit fields, negative-input normalization).
+- **Parsed-SVD cache is now invalidated when a debug session ends.** `clearSvdCache()` existed but had no callers, so a session against a different device could have kept the previous device's decode.
+- **Memory writes are verified.** New `writeMemoryWord` executor primitive (DAP `writeMemory` with GDB-`set` fallback) always reads the word back and throws "did not stick" on mismatch — a silently dropped write is exactly how "reset did nothing" happens in the field. Shared by `reset` and `read_cycle_counter`.
+
 ## [1.2.1] - 2026-07-11
 
 ### Fixed

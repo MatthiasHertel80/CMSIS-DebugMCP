@@ -50,6 +50,7 @@ CMSIS-DebugMCP is an MCP server that gives AI coding agents full control over th
 | **pause_execution** | DAP `pause` — halt a running target without ending the session. No-op if already stopped. | `timeoutMs` (optional) |
 | **step_over** / **step_into** / **step_out** | Step. Auto-heals on timeout: pauses the running target, reads PC + frame, reports where the firmware actually was. | `timeoutMs` (optional) |
 | **continue_execution** | Resume execution. Same auto-heal-on-timeout behavior. | `timeoutMs` (optional) |
+| **wait_for_stop** | Block until the target next stops (breakpoint, fault, step, pause) and return the stop reason + state, or a structured timeout. Replaces blind sleeping after an async continue. Issues no execution commands itself. | `timeoutMs` (optional) |
 | **add_breakpoint** | Add a breakpoint at a specific line. State-aware hint when the session is running. | `fileFullPath`<br>`lineContent` |
 | **remove_breakpoint** | Remove a breakpoint | `fileFullPath`<br>`line` |
 | **clear_all_breakpoints** / **list_breakpoints** | Breakpoint set management | None |
@@ -65,6 +66,9 @@ CMSIS-DebugMCP is an MCP server that gives AI coding agents full control over th
 |------|-------------|------------|
 | **read_memory** | Read a range of bytes from the target. DAP `readMemory` with multi-strategy GDB fallback. | `address` (hex)<br>`length` (1-4096)<br>`format` (`hex` / `ascii` / `both`)<br>`timeoutMs` (optional) |
 | **read_core_registers** | Read Cortex-M core registers (R0–R15, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK). Parallel evaluates with overall and per-request deadlines. | `timeoutMs` (optional) |
+| **read_cycle_counter** | DWT cycle counter (CYCCNT) for cycle-accurate timing between two stops. Enables trace + counter on first use; reports NOCYCCNT cores honestly; documents the 2³² wrap and halt/WFE stalls. | `timeoutMs` (optional) |
+| **reset** | Reset the target inside the live session (breakpoints survive) and VERIFY the reset took effect — PC is compared against the reset vector. Method selection (`auto`/`system`/`core`/`hardware`); honest "did NOT reset" reporting. | `method` (optional)<br>`halt` (optional)<br>`timeoutMs` (optional) |
+| **flash** | Program target flash via `pyocd load --cbuild-run` — synchronous bytes-programmed / structured flash error. Refuses while a debug session is active. | `cbuildRunFile` (optional)<br>`timeoutMs` (optional) |
 | **read_peripheral_register** | Read peripheral registers using SVD definitions (via Peripheral Inspector or SVD fallback) | `peripheral`<br>`register` (optional)<br>`timeoutMs` (optional) |
 | **get_fault_info** | Read and decode CFSR / HFSR / DFSR / MMFAR / BFAR / AFSR for HardFault analysis | `timeoutMs` (optional) |
 | **get_device_info** | Return session info: device, probe, processor, GDB server, ports, cbuild-run reference | None |
@@ -111,6 +115,7 @@ These are engineering invariants the agent can rely on — see [CHANGES-VS-UPSTR
 - **Inspection tools never lie about state.** If the target is running, the call returns a state-aware error pointing at the correct recovery tool (`pause_execution` / `add_breakpoint` / `continue_execution`) — not a misleading "no debug session".
 - **Concurrent tool calls don't trample each other.** Per-request `McpServer` + transport pair (matches the official MCP stateless example), eliminating the shared-server race.
 - **Motion timeouts always produce actionable output.** `continue_execution` / `step_*` auto-heal: on overshoot they pause the target, read PC + active frame, and tell you where the firmware actually was.
+- **`reset` never claims a reset that didn't happen.** The PC is verified against the reset vector afterwards; an unverified reset is reported as "did NOT appear to reset" with the adapter's own replies.
 - **`start_debugging` / `cmsis_action load_and_debug` refuse duplicates** with a structured message naming the existing session.
 - **Local & credential-free.** The MCP server runs 100% on localhost; nothing leaves the machine.
 

@@ -199,6 +199,14 @@ Defensive defaults:
 
 Software breakpoints (which Flash patches without a comparator) are *not* an option on Flash for most Cortex-M targets — only RAM-resident code can use them, which is rarely the case here.
 
+## ⏱️ Embedded execution control: wait_for_stop, reset, cycle timing
+
+**Never sleep blind waiting for a stop.** After `continue_execution` returned while the target was still running (timeout), or after issuing execution through `evaluate_expression` (`-exec continue`), call `wait_for_stop` — it blocks on the raw DAP `stopped` event and returns the stop reason + state, or a structured timeout. It returns immediately if the target is already stopped, and it issues no execution commands itself.
+
+**`reset` vs `restart_debugging`.** `restart_debugging` restarts the whole VS Code session (re-launch, breakpoints re-bound). `reset` resets only the target *inside* the live session — the session and breakpoints survive — and verifies the outcome: after the reset-halt the PC must equal the reset vector, or the tool says the target did NOT appear to reset. Trust the verification, not the command echo. Methods: `auto` (escalates `system` → `core` → `hardware`), `system` (SYSRESETREQ), `core` (VECTRESET), `hardware` (nSRST — only works when the reset line is wired from probe to target; if it isn't, no software reset can recover a wedge — power-cycle).
+
+**Cycle-accurate timing with `read_cycle_counter`.** Read the DWT cycle counter at point A, run to point B (`continue_execution` / `wait_for_stop`), read again, subtract mod 2^32. Caveats that bite: the 32-bit counter wraps (~10.7 s @ 400 MHz — accumulate over longer spans), and CYCCNT **stops while the core is halted and during WFE sleep** — it counts ACTIVE cycles only, so a delta excludes halted debug time and sleep.
+
 ## Common Patterns:
 ❌ **COMMON MISTAKE:** Starting debugging without breakpoints
 ✅ **BEST PRACTICE:** Always set an initial breakpoint before starting debugging
