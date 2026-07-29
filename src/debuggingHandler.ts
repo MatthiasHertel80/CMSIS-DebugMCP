@@ -70,6 +70,7 @@ export interface IDebuggingHandler {
     handleEvaluateExpression(args: { expression: string; timeoutMs?: number }): Promise<string>;
     handleReadMemory(args: { address: string; length: number; format?: 'hex' | 'ascii' | 'both'; timeoutMs?: number }): Promise<string>;
     handleReadCoreRegisters(args?: { timeoutMs?: number }): Promise<string>;
+    handleReadCycleCounter(args?: { timeoutMs?: number }): Promise<string>;
     handleReadPeripheralRegister(args: { peripheral: string; register?: string; timeoutMs?: number }): Promise<string>;
     handleGetFaultInfo(args?: { timeoutMs?: number }): Promise<string>;
     handleGetDeviceInfo(): Promise<string>;
@@ -1147,6 +1148,35 @@ REQUIRED NEXT STEPS:
             result += `  basepri   = ${this.normalizeRegToHex(regs['basepri'] || '<?>')}\n`;
             result += `  primask   = ${this.normalizeRegToHex(regs['primask'] || '<?>')}\n`;
 
+            return result;
+        });
+    }
+
+    /**
+     * Read the DWT cycle counter for cycle-accurate timing. Enables trace +
+     * CYCCNT on first use (a one-time, benign debug-unit state change).
+     */
+    public async handleReadCycleCounter(args?: { timeoutMs?: number }): Promise<string> {
+        return withHandlerTimeout('read_cycle_counter', args?.timeoutMs, async () => {
+            await this.ensureStoppedSession('read cycle counter');
+
+            const reading = await this.executor.readCycleCounter(args?.timeoutMs);
+            if (!reading.present) {
+                return 'This core reports no DWT cycle counter (DWT_CTRL.NOCYCCNT=1) — read_cycle_counter is ' +
+                    'unavailable. Use an RTOS tick or a timer peripheral for timing instead.';
+            }
+
+            const hex = `0x${reading.cycles.toString(16).padStart(8, '0')}`;
+            let result = `DWT cycle counter: ${reading.cycles} (${hex})\n`;
+            if (reading.enabledNow) {
+                result += 'DWT was enabled during this call — deltas are valid from now.\n';
+            }
+            result += 'Wrap: 32-bit, wraps every 2^32 cycles (~10.7 s @ 400 MHz) — for longer spans, sample ' +
+                'repeatedly and accumulate.\n';
+            result += 'Note: CYCCNT stops while the core is halted and during WFE sleep — it counts ACTIVE ' +
+                'cycles only.\n';
+            result += 'To time a region: read here, continue_execution / wait_for_stop to the end point, read ' +
+                'again, subtract (mod 2^32).';
             return result;
         });
     }

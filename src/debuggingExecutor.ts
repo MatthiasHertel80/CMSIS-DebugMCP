@@ -12,6 +12,7 @@ import {
     buildResetCommands, detectGdbServerKind, replyLooksUnsupported,
     GdbServerKind, ResetMethod,
 } from './core/resetAssist';
+import { DEMCR_TRCENA, DWT_ADDRESSES, DWT_CTRL_CYCCNTENA, DWT_CTRL_NOCYCCNT } from './core/dwt';
 import { logger } from './utils/logger';
 
 /**
@@ -72,6 +73,7 @@ export interface IDebuggingExecutor {
     writeMemoryWord(address: string, value: number, timeoutMs?: number): Promise<void>;
     resetTarget(options: { method?: 'auto' | ResetMethod; halt?: boolean; timeoutMs?: number }): Promise<ResetOutcome>;
     readCoreRegisters(timeoutMs?: number): Promise<Record<string, string>>;
+    readCycleCounter(timeoutMs?: number): Promise<{ cycles: number; enabledNow: boolean; present: boolean }>;
     readPeripheralRegister(peripheral: string, register?: string, timeoutMs?: number): Promise<string>;
     getFaultInfo(timeoutMs?: number): Promise<string>;
     getDeviceInfo(): Promise<string>;
@@ -1209,6 +1211,39 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 }
             }));
             return Object.fromEntries(entries);
+        });
+    }
+
+    /**
+     * Read the DWT cycle counter (CYCCNT), enabling trace + the counter when
+     * needed. Returns `present: false` on cores without a cycle counter
+     * (DWT_CTRL.NOCYCCNT). `enabledNow` tells the caller the counter was
+     * started by this call, so earlier deltas are not available. Note the
+     * counter stops while the core is halted AND during WFE sleep — it
+     * counts active cycles only — and wraps every 2^32 cycles.
+     */
+    public async readCycleCounter(timeoutMs?: number): Promise<{ cycles: number; enabledNow: boolean; present: boolean }> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+        const overallMs = capTimeout(timeoutMs, this.timeouts.memoryReadMs);
+        const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
+        return withTimeout('readCycleCounter', overallMs, async () => {
+            // DEMCR.TRCENA gates the whole DWT unit — enable it if it is off.
+            const demcr = await this.readMemoryWord(DWT_ADDRESSES.DEMCR, dapMs);
+            if (!(demcr & DEMCR_TRCENA)) {
+                await this.writeMemoryWord(DWT_ADDRESSES.DEMCR, (demcr | DEMCR_TRCENA) >>> 0, dapMs);
+            }
+            const ctrl = await this.readMemoryWord(DWT_ADDRESSES.DWT_CTRL, dapMs);
+            if (ctrl & DWT_CTRL_NOCYCCNT) {
+                return { present: false, cycles: 0, enabledNow: false };
+            }
+            let enabledNow = false;
+            if (!(ctrl & DWT_CTRL_CYCCNTENA)) {
+                await this.writeMemoryWord(DWT_ADDRESSES.DWT_CTRL, (ctrl | DWT_CTRL_CYCCNTENA) >>> 0, dapMs);
+                enabledNow = true;
+            }
+            const cycles = (await this.readMemoryWord(DWT_ADDRESSES.DWT_CYCCNT, dapMs)) >>> 0;
+            return { present: true, cycles, enabledNow };
         });
     }
 

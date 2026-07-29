@@ -342,6 +342,20 @@ export class DebugMCPServer {
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
+        // DWT cycle counter tool — cycle-accurate timing on the target.
+        mcpServer.registerTool('read_cycle_counter', {
+            description: 'Read the DWT cycle counter (CYCCNT) for cycle-accurate timing between two points on the ' +
+                'target: read here, continue_execution / wait_for_stop to the end point, read again, subtract (mod 2^32). ' +
+                'The 32-bit counter wraps (~10.7 s @ 400 MHz) and stops while the core is halted and during WFE sleep — ' +
+                'it counts ACTIVE cycles only. Enables DWT trace (DEMCR.TRCENA) and CYCCNT on first use — a one-time, ' +
+                'benign debug-unit state change. Reports when the core has no cycle counter.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
+            inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
+        }, async (args: { timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleReadCycleCounter(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
         // Read peripheral register tool
         mcpServer.registerTool('read_peripheral_register', {
             description: 'Read named peripheral registers using SVD data from the Peripheral Inspector extension. ' +
