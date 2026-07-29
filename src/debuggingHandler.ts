@@ -5,6 +5,7 @@ import { IDebugConfigurationManager } from './utils/debugConfigurationManager';
 import { DebugState } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { HardwareTimeoutError, withTimeout } from './utils/timeout';
+import { getRecentDiagnostics } from './utils/sessionStateTracker';
 import { logger } from './utils/logger';
 
 const HARD_HANDLER_CAP_MS = 60_000;
@@ -106,6 +107,18 @@ export class DebuggingHandler implements IDebuggingHandler {
     }
 
     /**
+     * Recent adapter-originated traffic (failed DAP responses, adapter
+     * stderr/console output) as an error-message suffix, or '' when the
+     * buffer is empty. Launch failures otherwise surface only as one nested
+     * message line while the real cause sits in the extension-host log.
+     */
+    private diagnosticsSuffix(): string {
+        const diag = getRecentDiagnostics();
+        if (diag.length === 0) { return ''; }
+        return `\nRecent adapter traffic (last ${diag.length} lines):\n  ${diag.join('\n  ')}`;
+    }
+
+    /**
      * Start a debugging session
      */
     public async handleStartDebugging(args: {
@@ -178,7 +191,7 @@ export class DebuggingHandler implements IDebuggingHandler {
                 throw new Error('Failed to start debug session. Make sure the appropriate language extension is installed.');
             }
         } catch (error) {
-            throw new Error(`Error starting debug session: ${error}`);
+            throw new Error(`Error starting debug session: ${error}${this.diagnosticsSuffix()}`);
         }
     }
 
@@ -1408,7 +1421,8 @@ REQUIRED NEXT STEPS:
                             `cannot select one for you.`;
                     } else {
                         commandFailed = `CMSIS command '${cmd}' failed: ${error}. ` +
-                            `Ensure the CMSIS Solution extension is installed and a solution context is active.`;
+                            `Ensure the CMSIS Solution extension is installed and a solution context is active.` +
+                            this.diagnosticsSuffix();
                     }
                 });
 
@@ -1446,7 +1460,8 @@ REQUIRED NEXT STEPS:
                         `connect — ${survived.detail}. ` +
                         `For 'attach' this almost always means no GDB server is listening on the configured port: ` +
                         `start the GDB server first, or use 'load_and_debug' (which launches one). ` +
-                        `Confirm with get_session_status / check_target_connection.`;
+                        `Confirm with get_session_status / check_target_connection.` +
+                        this.diagnosticsSuffix();
                 }
                 return `CMSIS '${args.action}' issued via '${cmd}'. The flash/connect pipeline is running in the ` +
                     `CMSIS extension (a multi-core flash + attach typically takes 20-40 s). This tool does not ` +
