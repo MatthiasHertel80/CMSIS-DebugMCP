@@ -2,9 +2,9 @@
 
 This fork of [microsoft/DebugMCP](https://github.com/microsoft/DebugMCP) adapts the MCP debugger server for **Arm Cortex-M targets driven through the CMSIS Debugger VS Code extension**. Upstream DebugMCP is language-agnostic; it assumes a `vscode.debug.startDebugging(...)` call against a standard `launch.json` of type `python`, `node`, `cppdbg`, etc. It has no concept of a GDB target server, no memory or register reads, no fault decoding, no SVD awareness, no per-call timeouts, and no resilience to a wedged probe. Everything in this document exists because that is the gap to close before an AI agent can debug real embedded hardware (pyOCD / J-Link / CMSIS-DAP + `gdbtarget`).
 
-Upstream baseline: forked at [`4422d8c`](https://github.com/microsoft/DebugMCP/commit/4422d8c) (2026-03-14), last synced against [`4051049`](https://github.com/microsoft/DebugMCP/commit/4051049) (upstream v2.3.0, 2026-08-05) in fork v1.3.0. See [§9](#9-upstream-work-deliberately-not-taken) for what was deliberately left behind.
+Upstream baseline: forked at [`4422d8c`](https://github.com/microsoft/DebugMCP/commit/4422d8c) (2026-03-14), last synced against [`4051049`](https://github.com/microsoft/DebugMCP/commit/4051049) (upstream v2.3.0, 2026-08-05) in fork v2.0.0. See [§9](#9-upstream-work-deliberately-not-taken) for what was deliberately left behind.
 
-Current fork release: **v1.3.0** (2026-08-10) — see [CHANGELOG.md](CHANGELOG.md) for the per-version detail.
+Current fork release: **v2.0.0** (2026-08-10) — see [CHANGELOG.md](CHANGELOG.md) for the per-version detail.
 
 ---
 

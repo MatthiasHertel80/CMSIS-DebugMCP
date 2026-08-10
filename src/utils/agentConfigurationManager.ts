@@ -135,6 +135,12 @@ export class AgentConfigurationManager {
      * Check if we should show the post-install popup
      */
     public async shouldShowPopup(): Promise<boolean> {
+        // Antigravity / Gemini configure MCP servers themselves, so the
+        // selection popup is noise there — it offers a choice the host has
+        // already made.
+        if (process.env.ANTIGRAVITY_ENV === 'true' || process.env.GEMINI_HOME) {
+            return false;
+        }
         // Check if popup has already been shown
         const popupShown = this.context.globalState.get<boolean>(this.POPUP_SHOWN_KEY, false);
         return !popupShown;
@@ -242,6 +248,22 @@ export class AgentConfigurationManager {
         console.log(`Detected platform: ${platform}, using config base path: ${configBasePath}`);
 
         const agents: AgentInfo[] = [
+            {
+                id: 'roo',
+                name: 'roo',
+                displayName: 'Roo Code',
+                configPath: path.join(configBasePath, 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline', 'settings', 'mcp_settings.json'),
+                configFormat: 'json',
+                mcpServerFieldName: 'mcpServers'
+            },
+            {
+                id: 'antigravity',
+                name: 'antigravity',
+                displayName: 'Antigravity',
+                configPath: path.join(os.homedir(), '.gemini', 'antigravity', 'mcp_config.json'),
+                configFormat: 'json',
+                mcpServerFieldName: 'mcpServers'
+            },
             {
                 id: 'cline',
                 name: 'cline',

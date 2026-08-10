@@ -4,11 +4,19 @@ All notable changes to CMSIS-DebugMCP will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.3.0] - 2026-08-10
+## [2.0.0] - 2026-08-10
 
 Upstream sync: the fork was based on `microsoft/DebugMCP` `4422d8c` (2026-03-14) and had cherry-picked three commits since. Upstream is 102 commits ahead at v2.3.0. This release takes what applies to Cortex-M, adapts what does not, and says which is which.
 
 It also carries the hardware-tool work that had accumulated unreleased on `feature/hw-tools-reset-wait-flash-dwt`.
+
+**Major, not minor.** Three things change behaviour an existing setup can depend on:
+
+- **A window no longer always runs its own MCP server.** One window binds `serverPort` and routes to the rest; the OS-assigned fallback port is gone. Anything that discovered a per-window port, or assumed "my window = my server", has to change. This is the fix for agents driving the wrong board, so the old behaviour is not coming back.
+- **The MCP transport is stateful.** Clients must carry the `mcp-session-id` from `initialize`. Every SDK client does; a hand-rolled client that POSTed bare JSON-RPC will now get a 400.
+- **`add_breakpoint` prefers `line` over `lineContent`.** `lineContent` still works and is not going away this release, but it is deprecated and the response says so.
+
+It also matches upstream's 2.x line, which this release syncs against.
 
 ### Added — hardware tools
 - **`wait_for_stop` tool** — block until the target next stops (breakpoint, fault, step-complete, pause) and return the stop reason plus the current debug state, or a structured timeout. Built on raw DAP `stopped` events from the session tracker (the ground truth), not VS Code UI events. Returns immediately with the recorded reason when the target is already stopped. This replaces sleeping blind after `continue_execution` returned while the target was still running — the pattern that once missed a 15 s playback window.
@@ -30,6 +38,7 @@ It also carries the hardware-tool work that had accumulated unreleased on `featu
 - **Secret redaction** (`cmsis-debugmcp.redactSecrets`, default on) — values whose name or content looks like a credential are withheld before leaving the extension, on the variable views and `evaluate_expression`. Two fork-specific carve-outs, because the upstream name-only policy misfires badly on firmware: **numeric scalars are never withheld** whatever the variable is called (a `uint8_t auth`, a `token` counter and `0xDEADBEEF` all stay readable — a 32-bit integer cannot carry a credential), and **raw target reads bypass redaction entirely** (`read_memory`, `read_core_registers`, `read_peripheral_register`, `get_fault_info`, and `-exec` GDB passthrough). Real SVDs name registers `KEY`, `KR`, `KEYR` and `UNLOCK` — the watchdog and flash unlock registers — and those are exactly what you need when the watchdog is resetting you. Strings, buffers and structures still get the full treatment.
 - **Multi-window routing.** External agents get exactly one MCP URL, and until now every window ran its own server on whatever port it could get while `agentConfigurationManager` wrote whichever port that window received — so the last window to start won and the agent routinely drove a window that did not hold the board. Now one window binds the well-known port and forwards each call to the window that owns the target, over a token-gated loopback control server, using a shared file registry of live windows. Upstream routes on a file path alone, which suffices there because every one of its tools takes one; only four do here, so the resolution ladder continues past the path: an explicit pin, the session's established target, the sole window with an active debug session (the normal one-window-one-board case), then the sole window. Ties resolve to an error naming every candidate rather than a guess — reading the wrong board's memory reads as a firmware bug and costs far more than being asked to pick.
 - **`list_debug_windows` and `select_debug_window` tools** — see the candidate windows and pin one for the session. Registered only when the server is actually routing.
+- **Roo Code and Antigravity** added to the agent registration roster, and the selection popup is suppressed under Antigravity/Gemini, which configure MCP servers themselves.
 - **`cmsis-debug-live` Agent Skill**, installed to `~/.agents/skills/` (and `~/.copilot/skills/` when present) on agent registration. Written for Cortex-M rather than adapted from upstream's host-process `debug-live`: target awareness from the CMSIS YAMLs, the five-state session gate, the FPB budget, what to do when a variable and the peripheral disagree, fault decode, and the routing tools. Named `cmsis-debug-live` so it cannot collide with upstream's skill when both extensions are installed.
 
 ### Changed — upstream sync
