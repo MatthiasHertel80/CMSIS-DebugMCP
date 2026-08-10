@@ -425,3 +425,5 @@ test/realboard/realboard.report.*.json
 node_modules/*
 out/*
 .vscode-test/*
+# macOS Finder metadata
+.DS_Store
