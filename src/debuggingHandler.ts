@@ -8,6 +8,13 @@ import { DebugState, formatBreakpointModifiers } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { HardwareTimeoutError, withTimeout } from './utils/timeout';
 import { fileExists, flashWithPyocd, probePyocd } from './core/flashController';
+import {
+    DapScope,
+    formatMissingNames,
+    renderScopes,
+    renderVariableNames,
+    selectVariables,
+} from './core/variableView';
 import { getRecentDiagnostics } from './utils/sessionStateTracker';
 import { logger } from './utils/logger';
 
@@ -70,7 +77,8 @@ export interface IDebuggingHandler {
     handleRemoveBreakpoint(args: { fileFullPath: string; line: number }): Promise<string>;
     handleClearAllBreakpoints(): Promise<string>;
     handleListBreakpoints(): Promise<string>;
-    handleGetVariables(args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string>;
+    handleListVariableNames(args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string>;
+    handleGetVariables(args: { scope?: 'local' | 'global' | 'all'; variableNames?: string[]; timeoutMs?: number }): Promise<string>;
     handleEvaluateExpression(args: { expression: string; timeoutMs?: number }): Promise<string>;
     handleReadMemory(args: { address: string; length: number; format?: 'hex' | 'ascii' | 'both'; timeoutMs?: number }): Promise<string>;
     handleReadCoreRegisters(args?: { timeoutMs?: number }): Promise<string>;
@@ -82,7 +90,7 @@ export interface IDebuggingHandler {
     handleGetSessionStatus(): Promise<string>;
     handleGetCallStack(args: { threadId?: number; levels?: number; timeoutMs?: number }): Promise<string>;
     handleGetThreads(args?: { timeoutMs?: number }): Promise<string>;
-    handleGetFrameVariables(args: { frameId: number; scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string>;
+    handleGetFrameVariables(args: { frameId: number; scope?: 'local' | 'global' | 'all'; variableNames?: string[]; timeoutMs?: number }): Promise<string>;
     handleCmsisCommand(args: { action: CmsisAction; timeoutMs?: number }): Promise<string>;
     handleFlash(args: { cbuildRunFile?: string; timeoutMs?: number }): Promise<string>;
 }
@@ -873,57 +881,77 @@ export class DebuggingHandler implements IDebuggingHandler {
     /**
      * Get variables from current debug context
      */
-    public async handleGetVariables(args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string> {
+    /**
+     * Read the scopes at the active frame, applying the 'global'-scope fallback
+     * that several adapters need. Shared by get_variables_values and
+     * list_variable_names so they can never disagree about what is in scope.
+     */
+    private async readActiveFrameScopes(
+        scope: 'local' | 'global' | 'all',
+        timeoutMs?: number,
+    ): Promise<{ scopes: DapScope[]; globalFallback: boolean }> {
+        const activeStackItem = vscode.debug.activeStackItem;
+        if (!activeStackItem || !('frameId' in activeStackItem)) {
+            throw new Error('No active stack frame. Make sure execution is paused at a breakpoint.');
+        }
+
+        let variablesData = await this.executor.getVariables(activeStackItem.frameId, scope, timeoutMs);
+
+        // If 'global' scope was requested but not available, fall back to all scopes.
+        let globalFallback = false;
+        if (scope === 'global' && (!variablesData.scopes || variablesData.scopes.length === 0)) {
+            variablesData = await this.executor.getVariables(activeStackItem.frameId, 'all', timeoutMs);
+            globalFallback = true;
+        }
+
+        return { scopes: (variablesData.scopes ?? []) as DapScope[], globalFallback };
+    }
+
+    public async handleListVariableNames(args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string> {
         const { scope = 'all', timeoutMs } = args;
+
+        return withHandlerTimeout('list_variable_names', timeoutMs, async () => {
+            await this.ensureStoppedSession('list variable names');
+            const { scopes } = await this.readActiveFrameScopes(scope, timeoutMs);
+            if (scopes.length === 0) {
+                return 'No variable scopes available at current execution point.';
+            }
+            return renderVariableNames(scopes);
+        });
+    }
+
+    public async handleGetVariables(args: {
+        scope?: 'local' | 'global' | 'all';
+        variableNames?: string[];
+        timeoutMs?: number;
+    }): Promise<string> {
+        const { scope = 'all', variableNames, timeoutMs } = args;
 
         return withHandlerTimeout('get_variables_values', timeoutMs, async () => {
             await this.ensureStoppedSession('read variables');
 
-            const activeStackItem = vscode.debug.activeStackItem;
-            if (!activeStackItem || !('frameId' in activeStackItem)) {
-                throw new Error('No active stack frame. Make sure execution is paused at a breakpoint.');
-            }
-
-            let variablesData = await this.executor.getVariables(activeStackItem.frameId, scope, timeoutMs);
-
-            // If 'global' scope was requested but not available, fall back to returning all scopes
-            let globalFallback = false;
-            if (scope === 'global' && (!variablesData.scopes || variablesData.scopes.length === 0)) {
-                variablesData = await this.executor.getVariables(activeStackItem.frameId, 'all', timeoutMs);
-                globalFallback = true;
-            }
-
-            if (!variablesData.scopes || variablesData.scopes.length === 0) {
+            const { scopes, globalFallback } = await this.readActiveFrameScopes(scope, timeoutMs);
+            if (scopes.length === 0) {
                 return 'No variable scopes available at current execution point.';
             }
 
-            let variablesInfo = '';
+            const { scopes: selected, missing } = variableNames?.length
+                ? selectVariables(scopes, variableNames)
+                : { scopes, missing: [] as string[] };
+
+            let out = '';
             if (globalFallback) {
-                variablesInfo += 'Note: No dedicated "Global" scope is available from this debug adapter. Showing all available scopes instead. Use evaluate_expression to inspect specific global variables by name.\n\n';
-            }
-            variablesInfo += 'Variables:\n==========\n\n';
-
-            for (const scopeItem of variablesData.scopes) {
-                variablesInfo += `${scopeItem.name}:\n`;
-                
-                if (scopeItem.error) {
-                    variablesInfo += `  Error retrieving variables: ${scopeItem.error}\n`;
-                } else if (scopeItem.variables && scopeItem.variables.length > 0) {
-                    for (const variable of scopeItem.variables) {
-                        variablesInfo += `  ${variable.name}: ${variable.value}`;
-                        if (variable.type) {
-                            variablesInfo += ` (${variable.type})`;
-                        }
-                        variablesInfo += '\n';
-                    }
-                } else {
-                    variablesInfo += '  No variables in this scope\n';
-                }
-                
-                variablesInfo += '\n';
+                out += 'Note: No dedicated "Global" scope is available from this debug adapter. Showing all available scopes instead. Use evaluate_expression to inspect specific global variables by name.\n\n';
             }
 
-            return variablesInfo;
+            if (variableNames?.length && selected.length === 0) {
+                return out + `None of the requested variables are in scope: ${variableNames.join(', ')}.\n` +
+                    'Call list_variable_names to see what is available here.';
+            }
+
+            out += renderScopes(selected, { header: 'Variables' });
+            out += formatMissingNames(missing);
+            return out;
         });
     }
 
@@ -1406,29 +1434,31 @@ REQUIRED NEXT STEPS:
     /**
      * Get variables for an explicit frame id (e.g. a caller frame from get_call_stack).
      */
-    public async handleGetFrameVariables(args: { frameId: number; scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string> {
-        const { frameId, scope = 'all', timeoutMs } = args;
+    public async handleGetFrameVariables(args: {
+        frameId: number;
+        scope?: 'local' | 'global' | 'all';
+        variableNames?: string[];
+        timeoutMs?: number;
+    }): Promise<string> {
+        const { frameId, scope = 'all', variableNames, timeoutMs } = args;
         return withHandlerTimeout('get_frame_variables', timeoutMs, async () => {
             await this.ensureStoppedSession('get frame variables');
             const variablesData = await this.executor.getVariablesForFrame(frameId, scope, timeoutMs);
-            if (!variablesData.scopes || variablesData.scopes.length === 0) {
+            const scopes = (variablesData.scopes ?? []) as DapScope[];
+            if (scopes.length === 0) {
                 return `No variable scopes available for frameId=${frameId}.`;
             }
-            let out = `Variables for frameId=${frameId}:\n==========\n\n`;
-            for (const scopeItem of variablesData.scopes) {
-                out += `${scopeItem.name}:\n`;
-                if (scopeItem.error) {
-                    out += `  Error retrieving variables: ${scopeItem.error}\n`;
-                } else if (scopeItem.variables && scopeItem.variables.length > 0) {
-                    for (const v of scopeItem.variables) {
-                        out += `  ${v.name}: ${v.value}${v.type ? ` (${v.type})` : ''}\n`;
-                    }
-                } else {
-                    out += '  No variables in this scope\n';
-                }
-                out += '\n';
+
+            const { scopes: selected, missing } = variableNames?.length
+                ? selectVariables(scopes, variableNames)
+                : { scopes, missing: [] as string[] };
+
+            if (variableNames?.length && selected.length === 0) {
+                return `None of the requested variables are in scope at frameId=${frameId}: ${variableNames.join(', ')}.`;
             }
-            return out;
+
+            return renderScopes(selected, { header: `Variables for frameId=${frameId}` })
+                + formatMissingNames(missing);
         });
     }
 

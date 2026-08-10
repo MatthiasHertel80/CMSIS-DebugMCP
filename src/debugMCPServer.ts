@@ -315,14 +315,33 @@ export class DebugMCPServer {
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
-        // Get variables tool
-        mcpServer.registerTool('get_variables_values', {
-            description: 'Inspect all variable values at the current execution point. This is your window into program state - see what data looks like at runtime, verify assumptions, identify unexpected values, and understand why code behaves as it does.',
+        // List variable names tool (discovery without reading any values)
+        mcpServer.registerTool('list_variable_names', {
+            description: 'List the names and types of variables visible at the current execution point, without reading their values. ' +
+                'Use this to discover what exists, then pull only what you need with get_variables_values — on a slow probe that is the difference between one round trip and thirty.',
+            annotations: { readOnlyHint: true, destructiveHint: false },
             inputSchema: {
                 scope: z.enum(['local', 'global', 'all']).optional().describe("Variable scope: 'local', 'global', or 'all'"),
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
         }, async (args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }) => {
+            const result = await this.debuggingHandler.handleListVariableNames(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Get variables tool
+        mcpServer.registerTool('get_variables_values', {
+            description: 'Inspect variable values at the current execution point. This is your window into program state - see what data looks like at runtime, verify assumptions, identify unexpected values, and understand why code behaves as it does. ' +
+                'Omit variableNames to dump the whole scope (usually fine on embedded targets, where frames are small); pass variableNames to read only what you need.',
+            inputSchema: {
+                scope: z.enum(['local', 'global', 'all']).optional().describe("Variable scope: 'local', 'global', or 'all'"),
+                variableNames: z.array(z.string()).min(1).max(50).optional().describe(
+                    'Optional filter: read only these variables, e.g. ["adc_raw", "state"]. ' +
+                    'Names that match nothing are reported back. Omit to return everything in scope.',
+                ),
+                timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
+            },
+        }, async (args: { scope?: 'local' | 'global' | 'all'; variableNames?: string[]; timeoutMs?: number }) => {
             const result = await this.debuggingHandler.handleGetVariables(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
@@ -471,9 +490,12 @@ export class DebugMCPServer {
             inputSchema: {
                 frameId: z.number().int().describe('DAP frame id, as returned by get_call_stack.'),
                 scope: z.enum(['local', 'global', 'all']).optional().describe("Variable scope: 'local', 'global', or 'all'"),
+                variableNames: z.array(z.string()).min(1).max(50).optional().describe(
+                    'Optional filter: read only these variables. Omit to return everything in the frame.',
+                ),
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
-        }, async (args: { frameId: number; scope?: 'local' | 'global' | 'all'; timeoutMs?: number }) => {
+        }, async (args: { frameId: number; scope?: 'local' | 'global' | 'all'; variableNames?: string[]; timeoutMs?: number }) => {
             const result = await this.debuggingHandler.handleGetFrameVariables(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
