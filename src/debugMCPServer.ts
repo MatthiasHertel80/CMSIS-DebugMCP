@@ -16,6 +16,8 @@ import { logger } from './utils/logger';
 import { serialHandler } from './serialHandler';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
+import { randomUUID } from 'node:crypto';
 
 /** The server must never be reachable off-box — it flashes and erases hardware without auth. */
 const LOOPBACK_BIND_ADDRESS = '127.0.0.1';
@@ -56,50 +58,80 @@ export function isLoopbackOrigin(origin: string): boolean {
  * Uses the official @modelcontextprotocol/sdk with SSE transport over express.
  */
 export class DebugMCPServer {
-    // No longer a singleton — a fresh McpServer is created per HTTP request
-    // so concurrent tool calls don't trample each other's transport.
     private httpServer: http.Server | null = null;
     private port: number;
     private actualPort: number | null = null;
     private initialized: boolean = false;
-    private debuggingHandler: IDebuggingHandler;
 
-    constructor(port: number, timeoutInSeconds: number, hardwareTimeouts?: Partial<HardwareTimeouts>) {
-        // Initialize the debugging components with dependency injection
-        const executor = new DebuggingExecutor(hardwareTimeouts);
-        const configManager = new ConfigurationManager();
-        this.debuggingHandler = new DebuggingHandler(executor, configManager, timeoutInSeconds);
+    /**
+     * Per-MCP-session handler factory. A fresh handler per session is what lets
+     * each agent session keep its own routing target (which VS Code window owns
+     * the board) once the routing handler is wired in.
+     */
+    private handlerFactory: () => IDebuggingHandler;
+
+    /**
+     * Live Streamable-HTTP transports keyed by MCP session id. A transport is
+     * created on `initialize` and reused for that session's POSTs, its GET SSE
+     * stream, and its DELETE teardown.
+     */
+    private transports: Record<string, StreamableHTTPServerTransport> = {};
+
+    constructor(
+        port: number,
+        timeoutInSeconds: number,
+        hardwareTimeouts?: Partial<HardwareTimeouts>,
+        handlerFactory?: () => IDebuggingHandler,
+    ) {
+        if (handlerFactory) {
+            this.handlerFactory = handlerFactory;
+        } else {
+            // Single-window default: debug in this very window.
+            const executor = new DebuggingExecutor(hardwareTimeouts);
+            const configManager = new ConfigurationManager();
+            const handler = new DebuggingHandler(executor, configManager, timeoutInSeconds);
+            this.handlerFactory = () => handler;
+        }
         this.port = port;
     }
 
     /**
-     * Initialize the MCP server. With per-request McpServer instances, this
-     * just flips the initialized flag — no shared server is constructed.
+     * Initialize the MCP server. No shared McpServer is constructed — one is
+     * built per session, in the POST /mcp handler.
      */
     async initialize() {
         this.initialized = true;
     }
 
     /**
-     * Build a fresh McpServer for a single HTTP request and register every
-     * tool + resource on it. Per-request instances mean concurrent tool
-     * calls cannot trample each other's transport (the bug that caused
-     * `get_threads` to hang after the third call).
+     * Build a fresh McpServer for one MCP session and register every tool +
+     * resource on it.
+     *
+     * Per *session*, not per request and not shared. The original shared
+     * instance was closed and reconnected on every request, so a concurrent
+     * call stripped the other's transport and its response went nowhere —
+     * that is what made `get_threads` hang after the third call. A
+     * session-scoped server never closes mid-flight, so that bug stays fixed
+     * while GET /mcp still has a real stream to attach to.
      */
     private createMcpServer(): McpServer {
         const mcpServer = new McpServer({
             name: 'cmsis-debugmcp',
             version: SERVER_VERSION,
         });
-        this.setupTools(mcpServer);
+        this.setupTools(mcpServer, this.handlerFactory());
         this.setupResources(mcpServer);
         return mcpServer;
     }
 
     /**
-     * Setup MCP tools that delegate to the debugging handler
+     * Register every tool on `mcpServer`, routed through `debuggingHandler`.
+     *
+     * The handler is a parameter rather than an instance field because each
+     * MCP session gets its own — in the multi-window setup that handler
+     * carries the session's routing target.
      */
-    private setupTools(mcpServer: McpServer) {
+    private setupTools(mcpServer: McpServer, debuggingHandler: IDebuggingHandler) {
         const TIMEOUT_DESC = 'Optional per-call timeout in milliseconds (capped to 60 000). Overrides the default for this single tool call. Use it when you can estimate the work and want a tighter or looser bound.';
 
         // Get debug instructions tool (for clients that don't support MCP resources like GitHub Copilot)
@@ -143,7 +175,7 @@ export class DebugMCPServer {
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
         }, async (args: { fileFullPath?: string; workingDirectory: string; testName?: string; configurationName?: string; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleStartDebugging(args);
+            const result = await debuggingHandler.handleStartDebugging(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -151,7 +183,7 @@ export class DebugMCPServer {
         mcpServer.registerTool('stop_debugging', {
             description: 'Stop the current debug session',
         }, async () => {
-            const result = await this.debuggingHandler.handleStopDebugging();
+            const result = await debuggingHandler.handleStopDebugging();
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -160,7 +192,7 @@ export class DebugMCPServer {
             description: 'Execute the current line of code without diving into it.',
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleStepOver(args);
+            const result = await debuggingHandler.handleStepOver(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -169,7 +201,7 @@ export class DebugMCPServer {
             description: 'Dive into the current line of code.',
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleStepInto(args);
+            const result = await debuggingHandler.handleStepInto(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -178,7 +210,7 @@ export class DebugMCPServer {
             description: 'Step out of the current function',
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleStepOut(args);
+            const result = await debuggingHandler.handleStepOut(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -189,7 +221,7 @@ export class DebugMCPServer {
                 'debug state on success, or a structured error if the probe is unresponsive.',
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handlePause(args);
+            const result = await debuggingHandler.handlePause(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -198,7 +230,7 @@ export class DebugMCPServer {
             description: 'Resume program execution until the next breakpoint is hit or the program completes.',
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleContinue(args);
+            const result = await debuggingHandler.handleContinue(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -213,7 +245,7 @@ export class DebugMCPServer {
             annotations: { readOnlyHint: true, destructiveHint: false },
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleWaitForStop(args);
+            const result = await debuggingHandler.handleWaitForStop(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -222,7 +254,7 @@ export class DebugMCPServer {
             description: 'Restart the debug session from the beginning with the same configuration.',
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleRestart(args);
+            const result = await debuggingHandler.handleRestart(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -244,7 +276,7 @@ export class DebugMCPServer {
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
         }, async (args: { method?: 'auto' | 'system' | 'core' | 'hardware'; halt?: boolean; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleReset(args);
+            const result = await debuggingHandler.handleReset(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -265,7 +297,7 @@ export class DebugMCPServer {
                 ),
             },
         }, async (args: { fileFullPath: string; line?: number; condition?: string; lineContent?: string }) => {
-            const result = await this.debuggingHandler.handleAddBreakpoint(args);
+            const result = await debuggingHandler.handleAddBreakpoint(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -283,7 +315,7 @@ export class DebugMCPServer {
                 condition: z.string().optional().describe('Optional condition expression; the message is only logged when it evaluates true.'),
             },
         }, async (args: { fileFullPath: string; line: number; logMessage: string; condition?: string }) => {
-            const result = await this.debuggingHandler.handleAddLogpoint(args);
+            const result = await debuggingHandler.handleAddLogpoint(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -295,7 +327,7 @@ export class DebugMCPServer {
                 line: z.number().describe('Line number (1-based)'),
             },
         }, async (args: { fileFullPath: string; line: number }) => {
-            const result = await this.debuggingHandler.handleRemoveBreakpoint(args);
+            const result = await debuggingHandler.handleRemoveBreakpoint(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -303,7 +335,7 @@ export class DebugMCPServer {
         mcpServer.registerTool('clear_all_breakpoints', {
             description: 'Clear all breakpoints at once. Use this after verifying the root cause to clean up before moving on to the next task.',
         }, async () => {
-            const result = await this.debuggingHandler.handleClearAllBreakpoints();
+            const result = await debuggingHandler.handleClearAllBreakpoints();
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -311,7 +343,7 @@ export class DebugMCPServer {
         mcpServer.registerTool('list_breakpoints', {
             description: 'View all currently set breakpoints across all files.',
         }, async () => {
-            const result = await this.debuggingHandler.handleListBreakpoints();
+            const result = await debuggingHandler.handleListBreakpoints();
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -325,7 +357,7 @@ export class DebugMCPServer {
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
         }, async (args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleListVariableNames(args);
+            const result = await debuggingHandler.handleListVariableNames(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -342,7 +374,7 @@ export class DebugMCPServer {
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
         }, async (args: { scope?: 'local' | 'global' | 'all'; variableNames?: string[]; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleGetVariables(args);
+            const result = await debuggingHandler.handleGetVariables(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -354,7 +386,7 @@ export class DebugMCPServer {
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
         }, async (args: { expression: string; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleEvaluateExpression(args);
+            const result = await debuggingHandler.handleEvaluateExpression(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -373,7 +405,7 @@ export class DebugMCPServer {
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
         }, async (args: { address: string; length: number; format?: 'hex' | 'ascii' | 'both'; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleReadMemory(args);
+            const result = await debuggingHandler.handleReadMemory(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -384,7 +416,7 @@ export class DebugMCPServer {
             annotations: { readOnlyHint: true, destructiveHint: false },
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleReadCoreRegisters(args);
+            const result = await debuggingHandler.handleReadCoreRegisters(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -398,7 +430,7 @@ export class DebugMCPServer {
             annotations: { readOnlyHint: true, destructiveHint: false },
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleReadCycleCounter(args);
+            const result = await debuggingHandler.handleReadCycleCounter(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -414,7 +446,7 @@ export class DebugMCPServer {
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
         }, async (args: { peripheral: string; register?: string; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleReadPeripheralRegister(args);
+            const result = await debuggingHandler.handleReadPeripheralRegister(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -426,7 +458,7 @@ export class DebugMCPServer {
             annotations: { readOnlyHint: true, destructiveHint: false },
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleGetFaultInfo(args);
+            const result = await debuggingHandler.handleGetFaultInfo(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -436,7 +468,7 @@ export class DebugMCPServer {
                 'GDB path, GDB server, port, and CMSIS config details.',
             annotations: { readOnlyHint: true, destructiveHint: false },
         }, async () => {
-            const result = await this.debuggingHandler.handleGetDeviceInfo();
+            const result = await debuggingHandler.handleGetDeviceInfo();
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -448,7 +480,7 @@ export class DebugMCPServer {
                 'is stopped (so DAP reads are valid). Never hangs — uses an internal short timeout.',
             annotations: { readOnlyHint: true, destructiveHint: false },
         }, async () => {
-            const result = await this.debuggingHandler.handleCheckTargetConnection();
+            const result = await debuggingHandler.handleCheckTargetConnection();
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -464,7 +496,7 @@ export class DebugMCPServer {
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
         }, async (args: { threadId?: number; levels?: number; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleGetCallStack(args);
+            const result = await debuggingHandler.handleGetCallStack(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -477,7 +509,7 @@ export class DebugMCPServer {
             annotations: { readOnlyHint: true, destructiveHint: false },
             inputSchema: { timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC) },
         }, async (args: { timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleGetThreads(args);
+            const result = await debuggingHandler.handleGetThreads(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -496,7 +528,7 @@ export class DebugMCPServer {
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC),
             },
         }, async (args: { frameId: number; scope?: 'local' | 'global' | 'all'; variableNames?: string[]; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleGetFrameVariables(args);
+            const result = await debuggingHandler.handleGetFrameVariables(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -653,7 +685,7 @@ export class DebugMCPServer {
                 timeoutMs: z.number().int().min(100).max(60_000).optional().describe(TIMEOUT_DESC + ' Applies to the session-readiness wait for load_and_debug / attach.'),
             },
         }, async (args: { action: 'build' | 'load' | 'erase' | 'load_and_run' | 'load_and_debug' | 'attach' | 'detach' | 'stop_run'; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleCmsisCommand(args);
+            const result = await debuggingHandler.handleCmsisCommand(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -676,7 +708,7 @@ export class DebugMCPServer {
                     .describe(TIMEOUT_DESC + ' Flash defaults to the full 60 s budget.'),
             },
         }, async (args: { cbuildRunFile?: string; timeoutMs?: number }) => {
-            const result = await this.debuggingHandler.handleFlash(args);
+            const result = await debuggingHandler.handleFlash(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -691,7 +723,7 @@ export class DebugMCPServer {
                 'failed tool calls.',
             annotations: { readOnlyHint: true, destructiveHint: false },
         }, async () => {
-            const result = await this.debuggingHandler.handleGetSessionStatus();
+            const result = await debuggingHandler.handleGetSessionStatus();
             return { content: [{ type: 'text' as const, text: result }] };
         });
     }
@@ -841,38 +873,90 @@ export class DebugMCPServer {
             // Parse JSON body for incoming requests
             app.use(express.json());
 
-            // Streamable HTTP endpoint — handles MCP protocol messages.
-            // Each POST creates its own McpServer + transport pair so
-            // concurrent tool calls cannot trample each other's transport.
+            // POST /mcp — client→server JSON-RPC. An `initialize` request with
+            // no session id opens a session (transport + McpServer pair) and is
+            // remembered by the generated id; later requests carrying that
+            // `mcp-session-id` reuse the same transport.
+            //
+            // Stateful session mode, not stateless. Stateless
+            // (sessionIdGenerator: undefined) cannot serve the server→client
+            // SSE stream a client opens with GET /mcp right after initialize,
+            // and it has no session identity for the routing handler to hang a
+            // target window off. It is also not what fixed the old
+            // `get_threads`-hangs-after-three-calls bug: that was a *shared*
+            // McpServer being closed and reconnected per request. A
+            // session-scoped server is never closed mid-flight.
             app.post('/mcp', async (req: any, res: any) => {
-                logger.info('New MCP request received');
-
-                const perRequestServer = this.createMcpServer();
-                const transport = new StreamableHTTPServerTransport({
-                    sessionIdGenerator: undefined, // Stateless mode
-                });
-
-                res.on('close', () => {
-                    transport.close().catch(() => { /* ignore */ });
-                    perRequestServer.close().catch(() => { /* ignore */ });
-                    logger.info('MCP transport closed');
-                });
-
                 try {
-                    await perRequestServer.connect(transport);
+                    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+                    let transport: StreamableHTTPServerTransport;
+
+                    if (sessionId && this.transports[sessionId]) {
+                        transport = this.transports[sessionId];
+                    } else if (!sessionId && isInitializeRequest(req.body)) {
+                        transport = new StreamableHTTPServerTransport({
+                            sessionIdGenerator: () => randomUUID(),
+                            onsessioninitialized: (sid: string) => {
+                                this.transports[sid] = transport;
+                                logger.info(`MCP session initialized: ${sid}`);
+                            },
+                        });
+                        transport.onclose = () => {
+                            const sid = transport.sessionId;
+                            if (sid && this.transports[sid]) {
+                                delete this.transports[sid];
+                                logger.info(`MCP session closed: ${sid}`);
+                            }
+                        };
+                        const sessionServer = this.createMcpServer();
+                        await sessionServer.connect(transport);
+                    } else {
+                        res.status(400).json({
+                            jsonrpc: '2.0',
+                            error: { code: -32000, message: 'Bad Request: no valid session ID provided' },
+                            id: null,
+                        });
+                        return;
+                    }
+
                     await transport.handleRequest(req, res, req.body);
                 } catch (err) {
                     logger.error('MCP request handling failed', err);
                     if (!res.headersSent) {
-                        res.status(500).json({ error: String(err) });
+                        res.status(500).json({
+                            jsonrpc: '2.0',
+                            error: { code: -32603, message: 'Internal MCP server error' },
+                            id: null,
+                        });
                     }
                 }
             });
 
+            // GET /mcp opens the server→client SSE notification stream for an
+            // existing session; DELETE /mcp tears one down. Both MUST be
+            // registered here at startup: previously only POST was, so GET fell
+            // through to Express's default 404. Cursor's MCP client treats that
+            // failed stream open as a fatal transport error and tombstones the
+            // connection as "errored" even while POST tool calls work fine.
+            const handleSessionRequest = async (req: any, res: any) => {
+                const sessionId = req.headers['mcp-session-id'] as string | undefined;
+                if (!sessionId || !this.transports[sessionId]) {
+                    res.status(400).json({
+                        jsonrpc: '2.0',
+                        error: { code: -32000, message: 'Bad Request: invalid or missing session ID' },
+                        id: null,
+                    });
+                    return;
+                }
+                await this.transports[sessionId].handleRequest(req, res);
+            };
+            app.get('/mcp', handleSessionRequest);
+            app.delete('/mcp', handleSessionRequest);
+
             // Legacy SSE endpoint for backward compatibility
             app.get('/sse', async (req: any, res: any) => {
-                res.status(410).json({ 
-                    error: 'SSE endpoint deprecated', 
+                res.status(410).json({
+                    error: 'SSE endpoint deprecated',
                     message: 'Please use POST /mcp endpoint instead',
                     newEndpoint: '/mcp'
                 });
@@ -958,8 +1042,17 @@ export class DebugMCPServer {
      * Stop the MCP server
      */
     async stop() {
-        // Note: With stateless StreamableHTTPServerTransport, transports are
-        // closed per-request — there is nothing to track and close manually.
+        // Close every live MCP session transport. In stateful mode these
+        // outlive individual requests, so without this the SSE streams and
+        // their sockets survive the HTTP server close.
+        for (const sessionId of Object.keys(this.transports)) {
+            try {
+                await this.transports[sessionId].close();
+            } catch (err) {
+                logger.warn(`Failed to close MCP session ${sessionId}: ${err}`);
+            }
+        }
+        this.transports = {};
 
         // Release any owned serial port and unsubscribe from the Serial Monitor bridge.
         try {
@@ -999,10 +1092,10 @@ export class DebugMCPServer {
     }
 
     /**
-     * Get the debugging handler (for testing purposes)
+     * Build a handler the way a new MCP session would (for testing purposes).
      */
     getDebuggingHandler(): IDebuggingHandler {
-        return this.debuggingHandler;
+        return this.handlerFactory();
     }
 
     /**
