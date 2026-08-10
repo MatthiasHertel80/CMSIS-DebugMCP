@@ -19,6 +19,24 @@ const watch = process.argv.includes('--watch');
  */
 const external = ['vscode', 'serialport'];
 
+/**
+ * `jsonc-parser`'s default entry is a UMD bundle that hands `require` to its
+ * factory as a *parameter*:
+ *
+ *     (function (factory) { ... factory(require, exports) ... })
+ *     (function (require, exports) { ... require("./impl/format") ... })
+ *
+ * esbuild cannot trace a `require` it does not own, so it leaves that call in
+ * place. At runtime it then resolves relative to `dist/`, where `impl/` does
+ * not exist, and activation dies with "Cannot find module './impl/format'".
+ *
+ * The package also ships an ESM build using ordinary static imports, which
+ * bundles correctly. Alias to it rather than marking the package external —
+ * jsonc-parser has no dependencies of its own, so this costs nothing and keeps
+ * the bundle self-contained.
+ */
+const alias = { 'jsonc-parser': 'jsonc-parser/lib/esm/main.js' };
+
 /** @type {import('esbuild').Plugin} */
 const esbuildProblemMatcherPlugin = {
     name: 'esbuild-problem-matcher',
@@ -49,6 +67,7 @@ async function main() {
         platform: 'node',
         outfile: 'dist/extension.js',
         external,
+        alias,
         logLevel: 'silent',
         plugins: [esbuildProblemMatcherPlugin],
     });

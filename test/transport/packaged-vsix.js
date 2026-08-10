@@ -45,7 +45,31 @@ check('package.json main exists in the VSIX', fs.existsSync(mainPath), pkg.main)
 check('no compiled tests are shipped',
     !fs.existsSync(path.join(root, 'out', 'test')) && !fs.existsSync(path.join(root, 'src')));
 
-// 3. serialport resolves *from the packaged tree*. This is the allow-list check.
+// 3. THE BUNDLE ACTUALLY LOADS.
+//     This is the check whose absence shipped a broken 2.0.2: esbuild left an
+//     untraceable `require("./impl/format")` from jsonc-parser's UMD wrapper in
+//     the bundle, so activation died instantly — while every other check here
+//     passed, because they never required the entry point. "It packaged" says
+//     nothing about whether it runs.
+let loadOk = false;
+let loadDetail = '';
+try {
+    const loaded = execFileSync(process.execPath, ['-e',
+        `require(${JSON.stringify(path.resolve(__dirname, 'vscode-stub.js'))});` +
+        `const m = require(${JSON.stringify(mainPath)});` +
+        `if (typeof m.activate !== 'function') { throw new Error('no activate export'); }` +
+        `if (typeof m.deactivate !== 'function') { throw new Error('no deactivate export'); }` +
+        `console.log('ok')`,
+    ], { encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+    loadOk = loaded.endsWith('ok');
+    loadDetail = loadOk ? 'activate/deactivate exported' : loaded;
+} catch (err) {
+    loadDetail = String(err.stderr || err.message).split('\n').find(l => /Error|Cannot/.test(l))
+        || String(err.message).split('\n')[0];
+}
+check('the bundle loads and exports activate/deactivate', loadOk, loadDetail);
+
+// 4. serialport resolves *from the packaged tree*. This is the allow-list check.
 let serialportOk = false;
 let serialportDetail = '';
 try {
@@ -57,7 +81,7 @@ try {
 }
 check('serialport loads from the packaged tree', serialportOk, serialportDetail);
 
-// 4. The native binding really binds — the failure node-gyp-build produces when
+// 5. The native binding really binds — the failure node-gyp-build produces when
 //    its prebuild directory is missing, which is the whole reason for step 3.
 let bindingOk = false;
 let bindingDetail = '';
@@ -76,14 +100,14 @@ try {
 }
 check('the native binding loads and enumerates ports', bindingOk, bindingDetail);
 
-// 5. The bundle did not swallow serialport — if it had, the require above could
+// 6. The bundle did not swallow serialport — if it had, the require above could
 //    pass while the extension still used a broken inlined copy.
 const bundle = fs.readFileSync(mainPath, 'utf8');
 check('the bundle keeps serialport external',
     /require\(["']serialport["']\)/.test(bundle),
     'bundle require()s serialport at runtime rather than inlining it');
 
-// 6. The skill ships, since agent registration copies it out of the extension.
+// 7. The skill ships, since agent registration copies it out of the extension.
 check('the agent skill ships', fs.existsSync(path.join(root, 'skills', 'cmsis-debug-live', 'SKILL.md')));
 
 fs.rmSync(tmp, { recursive: true, force: true });

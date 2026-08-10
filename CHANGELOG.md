@@ -4,6 +4,12 @@ All notable changes to CMSIS-DebugMCP will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.3] - 2026-08-10
+
+### Fixed
+- **2.0.2 could not activate at all: `Cannot find module './impl/format'`.** `jsonc-parser`'s default entry is a UMD bundle that hands `require` to its factory as a parameter, so esbuild cannot trace `require("./impl/format")` and left the call in the bundle; at runtime it resolved relative to `dist/`, where `impl/` does not exist. esbuild now aliases the package to its ESM build, which uses ordinary static imports.
+- **The packaged-VSIX harness never loaded the bundle**, which is how a completely dead extension passed every check and shipped. It now requires the entry point and asserts `activate`/`deactivate` are exported. Verified the check catches the original failure by rebuilding without the alias.
+
 ## [2.0.2] - 2026-08-10
 
 ### Fixed
