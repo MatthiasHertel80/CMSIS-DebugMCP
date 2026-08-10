@@ -7,12 +7,27 @@ This fork has the build script (`esbuild.js`) but **still ships unbundled
 
 ## Why it is not on
 
-`esbuild` could not be installed in the environment where this was prepared —
-four attempts, each stalling in its postinstall step, which downloads a
-platform binary. Without a working esbuild there is no way to build the bundle,
-let alone package a VSIX and check that the serial backend still loads. Turning
-the switches on regardless would have left `main` pointing at a `dist/` that
-nobody had ever produced.
+`esbuild` could not be installed in the environment where this was prepared.
+Five attempts, all failing the same way:
+
+```
+npm error code ETIMEDOUT
+npm error network request to https://registry.npmjs.org/esbuild/-/esbuild-0.28.0.tgz
+          failed, reason: read ETIMEDOUT
+```
+
+The `@esbuild/*` platform packages fetched fine; the `esbuild` tarball itself
+times out. That is a proxy / network problem on that machine, **not** anything
+about this repo — so on a normal connection step 1 below should simply work.
+Note the failure mode: one attempt left `node_modules/esbuild` as an *empty
+directory* rather than erroring, so check the package actually resolves
+(`node -e "require('esbuild')"`) before trusting an install that reported
+success.
+
+Without a working esbuild there is no way to build the bundle, let alone
+package a VSIX and check that the serial backend still loads. Turning the
+switches on regardless would have left `main` pointing at a `dist/` that nobody
+had ever produced.
 
 The plan for this work set an explicit gate: if the native-module story could
 not be pinned down quickly, keep `tsc`-only packaging, because the size win is
