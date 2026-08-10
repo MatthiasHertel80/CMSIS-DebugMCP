@@ -4,7 +4,7 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as jsonc from 'jsonc-parser';
 import { IDebugConfigurationManager } from './utils/debugConfigurationManager';
-import { DebugState } from './debugState';
+import { DebugState, formatBreakpointModifiers } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { HardwareTimeoutError, withTimeout } from './utils/timeout';
 import { fileExists, flashWithPyocd, probePyocd } from './core/flashController';
@@ -65,7 +65,8 @@ export interface IDebuggingHandler {
     handleWaitForStop(args?: { timeoutMs?: number }): Promise<string>;
     handleRestart(args?: { timeoutMs?: number }): Promise<string>;
     handleReset(args: { method?: 'auto' | 'system' | 'core' | 'hardware'; halt?: boolean; timeoutMs?: number }): Promise<string>;
-    handleAddBreakpoint(args: { fileFullPath: string; lineContent: string }): Promise<string>;
+    handleAddBreakpoint(args: { fileFullPath: string; line?: number; condition?: string; lineContent?: string }): Promise<string>;
+    handleAddLogpoint(args: { fileFullPath: string; line: number; logMessage: string; condition?: string }): Promise<string>;
     handleRemoveBreakpoint(args: { fileFullPath: string; line: number }): Promise<string>;
     handleClearAllBreakpoints(): Promise<string>;
     handleListBreakpoints(): Promise<string>;
@@ -530,45 +531,233 @@ export class DebuggingHandler implements IDebuggingHandler {
         return 'unconfirmed';
     }
 
-    public async handleAddBreakpoint(args: { fileFullPath: string; lineContent: string }): Promise<string> {
-        const { fileFullPath, lineContent } = args;
+    /**
+     * Resolve the target line(s) for a breakpoint request.
+     *
+     * `line` is the supported form. `lineContent` is the deprecated original
+     * form kept so existing agent prompts keep working: it substring-matches
+     * every line in the file, which in C routinely matches dozens of lines
+     * (`}`, `return;`, `break;`) and silently sets a breakpoint on all of them.
+     */
+    private static async resolveBreakpointLines(
+        fileFullPath: string,
+        line?: number,
+        lineContent?: string,
+    ): Promise<{ lines: number[]; usedFallback: boolean }> {
+        if (typeof line === 'number') {
+            if (!Number.isInteger(line) || line < 1) {
+                throw new Error(`Invalid line number ${line}: must be a 1-based integer.`);
+            }
+            return { lines: [line], usedFallback: false };
+        }
+
+        if (!lineContent) {
+            throw new Error(
+                'No location given: pass `line` (1-based line number). ' +
+                'The legacy `lineContent` form is still accepted but deprecated.',
+            );
+        }
+
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.file(fileFullPath));
+        const lines = document.getText().split(/\r?\n/);
+        const matching: number[] = [];
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes(lineContent)) {
+                matching.push(i + 1); // 1-based
+            }
+        }
+        if (matching.length === 0) {
+            throw new Error(`Could not find any lines containing: ${lineContent}`);
+        }
+        return { lines: matching, usedFallback: true };
+    }
+
+    /**
+     * Translate a VS Code logpoint message into a GDB `dprintf` format string
+     * plus its argument list.
+     *
+     * VS Code interpolates `{expr}` and infers the rendering from the runtime
+     * type. GDB's `printf` has no such inference — it needs an explicit
+     * conversion specifier per argument, and picking the wrong one prints
+     * garbage rather than erroring. So:
+     *
+     *   - `{expr}`      → `%d`   (the overwhelmingly common embedded case)
+     *   - `{expr:%s}`   → `%s`   (explicit specifier wins; use for strings,
+     *                             `%f` for floats, `%p` for pointers, ...)
+     *   - `{{` / `}}`   → literal `{` / `}`
+     *
+     * A literal `%` in the message is escaped to `%%` so it survives printf.
+     */
+    public static translateLogMessage(logMessage: string): { format: string; args: string[] } {
+        const SPECIFIER = /^(.*):(%[-+ #0-9.]*(?:hh|h|ll|l|z|j|t|L)?[diouxXeEfgGaAcsp])$/;
+        const args: string[] = [];
+        let format = '';
+
+        for (let i = 0; i < logMessage.length; i++) {
+            const ch = logMessage[i];
+
+            if ((ch === '{' || ch === '}') && logMessage[i + 1] === ch) {
+                format += ch; // doubled brace → literal brace
+                i++;
+                continue;
+            }
+
+            if (ch === '{') {
+                const close = logMessage.indexOf('}', i + 1);
+                if (close === -1) {
+                    throw new Error(
+                        `Unbalanced '{' in logMessage at position ${i}. ` +
+                        'Use {{ for a literal brace.',
+                    );
+                }
+                const inner = logMessage.slice(i + 1, close).trim();
+                if (!inner) {
+                    throw new Error(`Empty interpolation '{}' in logMessage at position ${i}.`);
+                }
+                const withSpec = SPECIFIER.exec(inner);
+                if (withSpec) {
+                    format += withSpec[2];
+                    args.push(withSpec[1].trim());
+                } else {
+                    format += '%d';
+                    args.push(inner);
+                }
+                i = close;
+                continue;
+            }
+
+            if (ch === '}') {
+                throw new Error(
+                    `Unbalanced '}' in logMessage at position ${i}. Use }} for a literal brace.`,
+                );
+            }
+
+            // Escape for both the GDB command string and printf itself.
+            if (ch === '%') { format += '%%'; }
+            else if (ch === '"') { format += '\\"'; }
+            else if (ch === '\\') { format += '\\\\'; }
+            else if (ch === '\n') { format += '\\n'; }
+            else { format += ch; }
+        }
+
+        return { format: `${format}\\n`, args };
+    }
+
+    /** Pull the breakpoint number out of a GDB `Dprintf N at 0x...` echo. */
+    private static parseGdbBreakpointNumber(raw: string): number | null {
+        const m = /(?:Dprintf|Breakpoint)\s+(\d+)\s+at/i.exec(raw ?? '');
+        return m ? Number(m[1]) : null;
+    }
+
+    public async handleAddLogpoint(args: {
+        fileFullPath: string;
+        line: number;
+        logMessage: string;
+        condition?: string;
+    }): Promise<string> {
+        const { fileFullPath, line, logMessage, condition } = args;
 
         try {
-            // Find the line number(s) containing the line content
-            const document = await vscode.workspace.openTextDocument(vscode.Uri.file(fileFullPath));
-            const text = document.getText();
-            const lines = text.split(/\r?\n/);
-            const matchingLineNumbers: number[] = [];
+            if (!Number.isInteger(line) || line < 1) {
+                throw new Error(`Invalid line number ${line}: must be a 1-based integer.`);
+            }
 
-            for (let i = 0; i < lines.length; i++) {
-                if (lines[i].includes(lineContent)) {
-                    matchingLineNumbers.push(i + 1); // Convert to 1-based line numbers
+            const { format, args: printfArgs } = DebuggingHandler.translateLogMessage(logMessage);
+            const uri = vscode.Uri.file(fileFullPath);
+
+            // 1) VS Code model, so the logpoint shows in the gutter and in
+            //    list_breakpoints like any other breakpoint.
+            await this.executor.addBreakpoint(uri, line, { condition, logMessage });
+
+            if (!this.executor.hasDebugSession()) {
+                return `Logpoint added at ${fileFullPath}:${line}\n` +
+                    `(No debug session yet — added to the breakpoint list. Re-add after the session is up ` +
+                    `so it is bound GDB-native via \`dprintf\`.)`;
+            }
+
+            // 2) GDB-native `dprintf` — the path that actually fires on gdbtarget.
+            const reply = await this.executor.setLogpointViaGdb(fileFullPath, line, format, printfArgs);
+            const cls = DebuggingHandler.classifyGdbBreakpointReply(reply);
+
+            const lines: string[] = [];
+            lines.push(`Logpoint added at ${fileFullPath}:${line}`);
+            lines.push(`  GDB: dprintf ${fileFullPath}:${line},"${format}"${printfArgs.length ? ',' + printfArgs.join(',') : ''}`);
+
+            if (cls === 'rejected') {
+                lines.push(`⚠️ GDB rejected the logpoint: ${reply}`);
+                lines.push(
+                    'Check that the path matches the ELF\'s compiled paths, and that every interpolated ' +
+                    'expression is in scope at that line.',
+                );
+                return lines.join('\n');
+            }
+
+            if (condition) {
+                // `dprintf` takes no inline `if` clause — the condition has to be
+                // attached by breakpoint number afterwards.
+                const bpNum = DebuggingHandler.parseGdbBreakpointNumber(reply);
+                if (bpNum !== null) {
+                    const condReply = await this.executor.setBreakpointConditionViaGdb(bpNum, condition);
+                    lines.push(`  Condition applied to GDB breakpoint ${bpNum}: ${condition}` +
+                        (condReply ? ` — ${condReply}` : ''));
+                } else {
+                    lines.push(
+                        `⚠️ Condition "${condition}" was set on the VS Code breakpoint but NOT on the GDB ` +
+                        `dprintf: the adapter did not echo a breakpoint number to attach it to. The logpoint ` +
+                        `will fire unconditionally. Apply it manually with ` +
+                        `evaluate_expression("-exec condition <n> ${condition}") after finding <n> via ` +
+                        `evaluate_expression("-exec info breakpoints").`,
+                    );
                 }
             }
 
-            if (matchingLineNumbers.length === 0) {
-                throw new Error(`Could not find any lines containing: ${lineContent}`);
-            }
+            lines.push(
+                '\nℹ️ On Cortex-M a logpoint is not free: the core halts on every hit while GDB formats and ' +
+                'prints, then resumes. In a hot loop or an ISR this distorts timing far more than it would in ' +
+                'a host process. For high-rate tracing prefer read_cycle_counter around the region, or have ' +
+                'the firmware fill a RAM buffer you read with read_memory.',
+            );
+            return lines.join('\n');
+        } catch (error) {
+            throw new Error(`Error adding logpoint: ${error}`);
+        }
+    }
+
+    public async handleAddBreakpoint(args: {
+        fileFullPath: string;
+        line?: number;
+        condition?: string;
+        lineContent?: string;
+    }): Promise<string> {
+        const { fileFullPath, line, condition, lineContent } = args;
+
+        try {
+            const { lines: targetLines, usedFallback } =
+                await DebuggingHandler.resolveBreakpointLines(fileFullPath, line, lineContent);
 
             const uri = vscode.Uri.file(fileFullPath);
 
             // 1) Add to VS Code's breakpoint model — keeps list_breakpoints and
             //    the editor gutter in sync.
-            for (const lineNumber of matchingLineNumbers) {
-                await this.executor.addBreakpoint(uri, lineNumber);
+            for (const lineNumber of targetLines) {
+                await this.executor.addBreakpoint(uri, lineNumber, { condition });
             }
 
             // 2) Bind GDB-native via `-exec break`. On gdbtarget sessions the
             //    VS Code model's setBreakpoints request is not reliably
             //    forwarded to the adapter, so the model add alone leaves the
             //    target running straight through. The GDB break makes it bind
-            //    for real — this is what actually stops the CPU.
+            //    for real — this is what actually stops the CPU. The condition
+            //    rides along as GDB's native `if` clause so the core is not
+            //    halted on every hit.
             const gdbReplies: string[] = [];
             let anyRejected = false;
             let anyConfirmed = false;
             if (this.executor.hasDebugSession()) {
-                for (const lineNumber of matchingLineNumbers) {
-                    const reply = await this.executor.setBreakpointViaGdb(fileFullPath, lineNumber);
+                for (const lineNumber of targetLines) {
+                    const reply = await this.executor.setBreakpointViaGdb(
+                        fileFullPath, lineNumber, undefined, condition,
+                    );
                     const cls = DebuggingHandler.classifyGdbBreakpointReply(reply);
                     if (cls === 'rejected') { anyRejected = true; }
                     if (cls === 'bound') { anyConfirmed = true; }
@@ -581,10 +770,16 @@ export class DebuggingHandler implements IDebuggingHandler {
                 }
             }
 
-            const locList = matchingLineNumbers.join(', ');
-            const head = matchingLineNumbers.length === 1
-                ? `Breakpoint added at ${fileFullPath}:${matchingLineNumbers[0]}`
-                : `Breakpoints added at ${matchingLineNumbers.length} locations in ${fileFullPath}: lines ${locList}`;
+            const condSuffix = condition ? ` [when: ${condition}]` : '';
+            const locList = targetLines.join(', ');
+            let head = targetLines.length === 1
+                ? `Breakpoint added at ${fileFullPath}:${targetLines[0]}${condSuffix}`
+                : `Breakpoints added at ${targetLines.length} locations in ${fileFullPath}: lines ${locList}${condSuffix}`;
+
+            if (usedFallback) {
+                head += `\n⚠️ Located via the deprecated \`lineContent\` match (${targetLines.length} line(s) matched). ` +
+                    `Pass \`line\` instead — content matching hits every line containing the text.`;
+            }
 
             if (!this.executor.hasDebugSession()) {
                 return `${head}\n(No debug session yet — added to the breakpoint list. ` +
@@ -663,9 +858,9 @@ export class DebuggingHandler implements IDebuggingHandler {
                 if (bp instanceof vscode.SourceBreakpoint) {
                     const fileName = bp.location.uri.fsPath.split(/[/\\]/).pop();
                     const line = bp.location.range.start.line + 1;
-                    breakpointList += `${index + 1}. ${fileName}:${line}\n`;
+                    breakpointList += `${index + 1}. ${fileName}:${line}${formatBreakpointModifiers(bp)}\n`;
                 } else if (bp instanceof vscode.FunctionBreakpoint) {
-                    breakpointList += `${index + 1}. Function: ${bp.functionName}\n`;
+                    breakpointList += `${index + 1}. Function: ${bp.functionName}${formatBreakpointModifiers(bp)}\n`;
                 }
             });
 

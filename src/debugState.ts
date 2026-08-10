@@ -12,6 +12,32 @@ export interface StackFrame {
 }
 
 /**
+ * The subset of a breakpoint that affects how it is rendered. Structural
+ * rather than `vscode.Breakpoint` so this module stays free of the vscode
+ * import and remains unit-testable outside the extension host.
+ */
+export interface BreakpointModifiers {
+    condition?: string;
+    logMessage?: string;
+    hitCondition?: string;
+    enabled?: boolean;
+}
+
+/**
+ * Render a breakpoint's modifiers as a compact suffix, so an agent can tell a
+ * plain breakpoint from a conditional one or a logpoint without a second call.
+ * Shared by list_breakpoints and the DebugState breakpoint summary.
+ */
+export function formatBreakpointModifiers(bp: BreakpointModifiers): string {
+    const parts: string[] = [];
+    if (bp.condition) { parts.push(`when: ${bp.condition}`); }
+    if (bp.logMessage) { parts.push(`log: ${bp.logMessage}`); }
+    if (bp.hitCondition) { parts.push(`hits: ${bp.hitCondition}`); }
+    if (bp.enabled === false) { parts.push('disabled'); }
+    return parts.length ? ` [${parts.join(', ')}]` : '';
+}
+
+/**
  * Represents the current state of a debugging session
  */
 export class DebugState {

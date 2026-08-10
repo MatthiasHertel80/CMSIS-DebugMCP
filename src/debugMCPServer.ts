@@ -250,13 +250,40 @@ export class DebugMCPServer {
 
         // Add breakpoint tool
         mcpServer.registerTool('add_breakpoint', {
-            description: 'Set a breakpoint to pause execution at a critical line of code. Essential for debugging: pause before potential errors, examine state at decision points, or verify code paths. Breakpoints let you inspect variables and control flow at exact moments.',
+            description: 'Set a breakpoint to pause execution at a critical line of code. Essential for debugging: pause before potential errors, examine state at decision points, or verify code paths. ' +
+                'On Cortex-M the number of simultaneously bound breakpoints is limited by the FPB unit (commonly 6 on Cortex-M4/M7, 4 on Cortex-M0+) — clear ones you no longer need.',
             inputSchema: {
                 fileFullPath: z.string().describe('Full path to the file'),
-                lineContent: z.string().describe('Line content'),
+                line: z.number().int().min(1).optional().describe('Line number (1-based) where the breakpoint should be set. Preferred.'),
+                condition: z.string().optional().describe(
+                    'Optional condition expression in target-language syntax, e.g. "i == 100" or "p != 0". ' +
+                    'Applied as GDB\'s native `if` clause, so the CPU is only halted when it holds — important in hot loops.',
+                ),
+                lineContent: z.string().optional().describe(
+                    'DEPRECATED: substring of the line to break on. Sets a breakpoint on EVERY line containing this text, ' +
+                    'which in C routinely matches dozens of lines. Pass `line` instead. Only used when `line` is omitted.',
+                ),
             },
-        }, async (args: { fileFullPath: string; lineContent: string }) => {
+        }, async (args: { fileFullPath: string; line?: number; condition?: string; lineContent?: string }) => {
             const result = await this.debuggingHandler.handleAddBreakpoint(args);
+            return { content: [{ type: 'text' as const, text: result }] };
+        });
+
+        // Add logpoint tool
+        mcpServer.registerTool('add_logpoint', {
+            description: 'Add a logpoint: a breakpoint that prints a message and resumes instead of pausing. Useful for tracing values across many iterations. ' +
+                'Embed expressions in curly braces to interpolate runtime values, e.g. "adc={sample} state={fsm}". ' +
+                'GDB needs an explicit printf conversion per value: {expr} defaults to %d, use {expr:%s} / {expr:%f} / {expr:%p} to override; {{ and }} are literal braces. ' +
+                'NOTE for Cortex-M: this is NOT free — the core halts on each hit while GDB formats and prints, then resumes. ' +
+                'In an ISR or a hot loop it distorts timing badly; prefer read_cycle_counter or a firmware RAM buffer read back with read_memory.',
+            inputSchema: {
+                fileFullPath: z.string().describe('Full path to the file'),
+                line: z.number().int().min(1).describe('Line number (1-based) where the logpoint should be set'),
+                logMessage: z.string().describe('Message to log. Wrap expressions in {curly braces} to interpolate runtime values.'),
+                condition: z.string().optional().describe('Optional condition expression; the message is only logged when it evaluates true.'),
+            },
+        }, async (args: { fileFullPath: string; line: number; logMessage: string; condition?: string }) => {
+            const result = await this.debuggingHandler.handleAddLogpoint(args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 

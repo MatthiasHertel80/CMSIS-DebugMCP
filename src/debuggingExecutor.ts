@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 
 import * as vscode from 'vscode';
-import { DebugState, StackFrame } from './debugState';
+import { DebugState, StackFrame, formatBreakpointModifiers } from './debugState';
 import { customRequestWithTimeout, HardwareTimeoutError, withTimeout } from './utils/timeout';
 import {
     isSessionStopped, getStoppedReason, resolveActiveSession,
@@ -56,9 +56,11 @@ export interface IDebuggingExecutor {
     pause(timeoutMs?: number): Promise<void>;
     waitForStop(timeoutMs?: number): Promise<StopWaitResult | { kind: 'already-stopped'; reason: string | null }>;
     restart(): Promise<void>;
-    addBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
+    addBreakpoint(uri: vscode.Uri, line: number, options?: { condition?: string; logMessage?: string }): Promise<void>;
     removeBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
-    setBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number): Promise<string>;
+    setBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number, condition?: string): Promise<string>;
+    setLogpointViaGdb(fileFullPath: string, line: number, format: string, args: string[], timeoutMs?: number): Promise<string>;
+    setBreakpointConditionViaGdb(breakpointNumber: number, condition: string, timeoutMs?: number): Promise<string>;
     clearBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number): Promise<string>;
     clearAllBreakpointsViaGdb(timeoutMs?: number): Promise<string>;
     getCurrentDebugState(numNextLines: number): Promise<DebugState>;
@@ -372,10 +374,18 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Add a breakpoint at specified location
      */
-    public async addBreakpoint(uri: vscode.Uri, line: number): Promise<void> {
+    public async addBreakpoint(
+        uri: vscode.Uri,
+        line: number,
+        options?: { condition?: string; logMessage?: string }
+    ): Promise<void> {
         try {
             const breakpoint = new vscode.SourceBreakpoint(
-                new vscode.Location(uri, new vscode.Position(line - 1, 0))
+                new vscode.Location(uri, new vscode.Position(line - 1, 0)),
+                true,
+                options?.condition,
+                undefined,
+                options?.logMessage,
             );
             vscode.debug.addBreakpoints([breakpoint]);
         } catch (error) {
@@ -431,9 +441,60 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * does and binds the breakpoint for real. Returns the raw GDB/adapter
      * text; the caller interprets it (a missing "Breakpoint N" echo is NOT a
      * failure — see execGdbCommand).
+     *
+     * A `condition` is appended as GDB's native `if <expr>` clause, so the CPU
+     * is only halted when it holds. That matters far more on a Cortex-M than in
+     * a host process: a VS Code-side condition would still stop the core on
+     * every hit and evaluate afterwards, wrecking timing in a hot loop.
      */
-    public async setBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number): Promise<string> {
-        const { raw } = await this.execGdbCommand(`break ${fileFullPath}:${line}`, timeoutMs);
+    public async setBreakpointViaGdb(
+        fileFullPath: string,
+        line: number,
+        timeoutMs?: number,
+        condition?: string,
+    ): Promise<string> {
+        const cond = condition?.trim() ? ` if ${condition.trim()}` : '';
+        const { raw } = await this.execGdbCommand(`break ${fileFullPath}:${line}${cond}`, timeoutMs);
+        return raw;
+    }
+
+    /**
+     * Bind a logpoint GDB-native via `-exec dprintf file:line,"fmt",args`.
+     *
+     * GDB's `dprintf` is the exact analogue of a VS Code logpoint: it prints
+     * and resumes rather than halting. The core is still halted momentarily per
+     * hit (nothing on a Cortex-M can print without stopping it), so this is not
+     * free — see the tool description.
+     *
+     * `format` must already be a printf format string and `args` the matching
+     * expression list; translation from the `{expr}` logpoint syntax happens in
+     * the handler, which is where the specifier rules are documented.
+     */
+    public async setLogpointViaGdb(
+        fileFullPath: string,
+        line: number,
+        format: string,
+        args: string[],
+        timeoutMs?: number,
+    ): Promise<string> {
+        const argList = args.length > 0 ? `,${args.join(',')}` : '';
+        const { raw } = await this.execGdbCommand(
+            `dprintf ${fileFullPath}:${line},"${format}"${argList}`,
+            timeoutMs,
+        );
+        return raw;
+    }
+
+    /**
+     * Attach a condition to an already-created GDB breakpoint by number.
+     * Used for conditional logpoints: `dprintf` takes no inline `if` clause.
+     */
+    public async setBreakpointConditionViaGdb(
+        breakpointNumber: number,
+        condition: string,
+        timeoutMs?: number,
+    ): Promise<string> {
+        const { raw } = await this.execGdbCommand(`condition ${breakpointNumber} ${condition}`, timeoutMs);
         return raw;
     }
 
@@ -515,7 +576,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             .map(bp => {
                 const fileName = bp.location.uri.fsPath.split(/[/\\]/).pop() || 'unknown';
                 const line = bp.location.range.start.line + 1;
-                return `${fileName}:${line}`;
+                return `${fileName}:${line}${formatBreakpointModifiers(bp)}`;
             });
         state.updateBreakpoints(formattedBreakpoints);
 
