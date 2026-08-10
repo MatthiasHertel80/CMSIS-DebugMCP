@@ -2,9 +2,9 @@
 
 This fork of [microsoft/DebugMCP](https://github.com/microsoft/DebugMCP) adapts the MCP debugger server for **Arm Cortex-M targets driven through the CMSIS Debugger VS Code extension**. Upstream DebugMCP is language-agnostic; it assumes a `vscode.debug.startDebugging(...)` call against a standard `launch.json` of type `python`, `node`, `cppdbg`, etc. It has no concept of a GDB target server, no memory or register reads, no fault decoding, no SVD awareness, no per-call timeouts, and no resilience to a wedged probe. Everything in this document exists because that is the gap to close before an AI agent can debug real embedded hardware (pyOCD / J-Link / CMSIS-DAP + `gdbtarget`).
 
-Upstream commit this fork is based on: [`4422d8c` — "upgrade version"](https://github.com/microsoft/DebugMCP/commit/4422d8c).
+Upstream baseline: forked at [`4422d8c`](https://github.com/microsoft/DebugMCP/commit/4422d8c) (2026-03-14), last synced against [`4051049`](https://github.com/microsoft/DebugMCP/commit/4051049) (upstream v2.3.0, 2026-08-05) in fork v1.3.0. See [§9](#9-upstream-work-deliberately-not-taken) for what was deliberately left behind.
 
-Current fork release: **v1.2.1** (2026-07-11) — see [CHANGELOG.md](CHANGELOG.md) for the per-version detail.
+Current fork release: **v1.3.0** (2026-08-10) — see [CHANGELOG.md](CHANGELOG.md) for the per-version detail.
 
 ---
 
@@ -171,3 +171,30 @@ Tool schemas that differ from names agents commonly guess — worth documenting 
 ## 8. Relationship to upstream
 
 This fork is **not** intended to be merged back as-is — the embedded surface (CMSIS pipeline, fault decoder, SVD reader, hardware-timeout layer, dual serial backend) would be dead code for the 95% of upstream users debugging Python/TypeScript. The clean path for upstreaming would be factoring `src/core/*`, `src/utils/timeout.ts`, and `src/utils/sessionStateTracker.ts` into an optional "embedded" feature module gated on the presence of the CMSIS Debugger extension, and making the timeout layer + state-aware errors available generically while keeping the SVD / fault decoder / CMSIS panel controls gated. That refactor is out of scope for this evaluation build.
+
+---
+
+## 9. Upstream work deliberately not taken
+
+Synced against upstream v2.3.0. These are the changes that were considered and rejected, with the reason — so the next sync does not re-litigate them.
+
+| Upstream change | Why not |
+|---|---|
+| **`get_variables_values` requires `variableNames`** (2.3.0, breaking) | Taken as an *optional* filter instead, alongside the new `list_variable_names`. Embedded frames are small, so the full dump is usually what you want; making it mandatory would break every existing agent prompt for no gain here. |
+| **`src/utils/withTimeout.ts`** | The fork's `src/utils/timeout.ts` is a strict superset — it also carries `customRequestWithTimeout` and `HardwareTimeoutError`. Porting it would mean two timeout utilities. |
+| **`debugTestAtCursor` / VS Code Testing API test debugging** | No meaning for `gdbtarget` firmware. There is no test runner on the target. |
+| **`debugConfigurationManager` refactor** (`-396` lines) | Upstream's went toward .NET/csproj auto-configuration. The fork's version is CMSIS-specific and keeps `jsonc-parser` (which upstream dropped) because CMSIS Solution generates `launch.json` *with comments*. |
+| **Removal of `get_debug_instructions` and its doc** | Kept. Upstream replaced them with the `debug-live` Agent Skill, but GitHub Copilot Chat reads MCP tools and not `~/.agents/skills` — removing the tool would leave that harness with no guidance at all. The fork ships *both*: the tool and the `cmsis-debug-live` skill. |
+| **The `debug-live` skill name** | The fork's skill is `cmsis-debug-live`. Both extensions can be installed at once and would otherwise fight over the same directory, leaving whichever registered last in place with a workflow written for the wrong kind of target. For the same reason the fork does no legacy-name cleanup — removing a `debug-live` directory would delete upstream's skill. |
+| **`6f7fa56` "Remove extra checks in hasActiveSession()"** | Not ported (since v1.1.9). The fork replaced that gate with a DAP-event tracker plus `ensureStoppedSession` and state-aware errors, which is the better fix for embedded targets. |
+
+### Taken, but adapted
+
+| Upstream change | How it differs here |
+|---|---|
+| **Multi-window routing** (PR #104) | Same router/registry/control-server shape, but upstream resolves targets from a file path alone — fine there, since every one of its tools takes one. Only four do here, so the ladder continues: explicit pin → session target → the sole window with an active debug session → the sole window. Ties error out naming every candidate instead of guessing. Adds `list_debug_windows` / `select_debug_window`. Dispatch uses one compile-time-checked op table rather than two hand-written switches, because 42 ops duplicated twice would drift. |
+| **Secret redaction** (PR #119) | Module ported nearly verbatim, policy adapted. Numeric scalars are never withheld whatever the variable is called — in firmware `auth`, `token` and `secret` are overwhelmingly `uint8_t` flags and parser tags, and a 32-bit integer cannot carry a credential. Raw target reads bypass redaction entirely, because real SVDs name registers `KEY`, `KR`, `KEYR` and `UNLOCK`. |
+| **Logpoints** (issue #15) | Bound GDB-native via `dprintf`, with explicit printf specifiers (`{expr}` → `%d`, `{expr:%s}` to override) since GDB infers nothing about types. A condition is attached afterwards by breakpoint number, because `dprintf` takes no inline `if`. The tool description states plainly that the core still halts per hit — logpoints are not free on a Cortex-M. |
+| **`add_breakpoint` by line** (issue #18) | Taken, but `lineContent` is retained as a deprecated fallback so existing agent prompts keep working. |
+| **Stateful session transport** (PR #96) | Taken. Note this replaced the fork's *per-request* model, which existed to fix a concurrency bug — the regression is guarded by `test/transport/session-lifecycle.js`. |
+| **esbuild bundling** | Script prepared, **packaging not switched over** — see [docs/packaging-esbuild.md](docs/packaging-esbuild.md). `serialport` must stay external regardless: `node-gyp-build` resolves its native `.node` relative to `__dirname` at runtime. |

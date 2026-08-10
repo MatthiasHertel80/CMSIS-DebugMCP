@@ -8,7 +8,7 @@ Works with **GitHub Copilot**, **Claude Code**, **Claude Desktop**, **Cline**, *
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.104.0+-blue.svg)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-1.2.1-green.svg)](https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases)
+[![Version](https://img.shields.io/badge/version-1.3.0-green.svg)](https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases)
 
 <p align="center">
   <img src="assets/DebugMCP.webp" alt="CMSIS-DebugMCP Demo" width="800">
@@ -51,14 +51,17 @@ CMSIS-DebugMCP is an MCP server that gives AI coding agents full control over th
 | **step_over** / **step_into** / **step_out** | Step. Auto-heals on timeout: pauses the running target, reads PC + frame, reports where the firmware actually was. | `timeoutMs` (optional) |
 | **continue_execution** | Resume execution. Same auto-heal-on-timeout behavior. | `timeoutMs` (optional) |
 | **wait_for_stop** | Block until the target next stops (breakpoint, fault, step, pause) and return the stop reason + state, or a structured timeout. Replaces blind sleeping after an async continue. Issues no execution commands itself. | `timeoutMs` (optional) |
-| **add_breakpoint** | Add a breakpoint at a specific line. State-aware hint when the session is running. | `fileFullPath`<br>`lineContent` |
+| **add_breakpoint** | Add a breakpoint at a 1-based line, optionally conditional. The condition becomes GDB's native `if`, so the core is only halted when it holds. State-aware hint when the session is running. | `fileFullPath`<br>`line`<br>`condition` (optional)<br>`lineContent` (deprecated) |
+| **add_logpoint** | Print a message and resume instead of halting, via GDB `dprintf`. `{expr}` interpolates as `%d`; `{expr:%s}` overrides the specifier. Note: the core still halts per hit to print. | `fileFullPath`<br>`line`<br>`logMessage`<br>`condition` (optional) |
 | **remove_breakpoint** | Remove a breakpoint | `fileFullPath`<br>`line` |
 | **clear_all_breakpoints** / **list_breakpoints** | Breakpoint set management | None |
-| **get_variables_values** | Variables at the active frame | `scope` (`local` / `global` / `all`)<br>`timeoutMs` (optional) |
+| **list_variable_names** | Names and types in scope, reading no values. Discover first, then read only what you need. | `scope` (optional)<br>`timeoutMs` (optional) |
+| **get_variables_values** | Variables at the active frame. Omit `variableNames` for the whole scope, or name up to 50 to read just those. | `scope` (`local` / `global` / `all`)<br>`variableNames` (optional)<br>`timeoutMs` (optional) |
 | **evaluate_expression** | Evaluate an expression in the current frame | `expression`<br>`timeoutMs` (optional) |
 | **get_call_stack** | Full DAP stackTrace with `frameId` per frame | `threadId` (optional)<br>`levels` (optional, ≤200)<br>`timeoutMs` (optional) |
 | **get_threads** | DAP threads enumeration. With RTOS-aware GDB servers (pyOCD `--rtos`, J-Link plugin) returns FreeRTOS / RTX / ThreadX tasks. | `timeoutMs` (optional) |
-| **get_frame_variables** | Inspect variables at an explicit `frameId` without changing the active editor frame | `frameId`<br>`scope` (optional)<br>`timeoutMs` (optional) |
+| **get_frame_variables** | Inspect variables at an explicit `frameId` without changing the active editor frame | `frameId`<br>`scope` (optional)<br>`variableNames` (optional)<br>`timeoutMs` (optional) |
+| **list_debug_windows** / **select_debug_window** | Show the VS Code windows the server can drive, and pin one for this session. Registered only when routing. | `pid` or `workspaceFolder` |
 
 ### 🧠 Embedded / Cortex-M Tools
 
@@ -279,8 +282,9 @@ Configure CMSIS-DebugMCP behavior in VSCode settings:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `cmsis-debugmcp.serverPort` | `3001` | Preferred port for the MCP server. If busy, an OS-assigned port is used instead. |
+| `cmsis-debugmcp.serverPort` | `3001` | Port for the MCP server. One window binds it and routes to the others; there is no per-window fallback port. |
 | `cmsis-debugmcp.timeoutInSeconds` | `180` | Timeout for debugging operations |
+| `cmsis-debugmcp.redactSecrets` | `true` | Withhold variable/expression values that look like credentials. Numeric scalars and raw target reads (`read_memory`, registers, peripherals, `-exec`) are never withheld. |
 
 Changing `serverPort` requires a window reload; the extension will offer to do it for you.
 
@@ -288,9 +292,13 @@ Changing `serverPort` requires a window reload; the extension will offer to do i
 
 The MCP server binds **`127.0.0.1` only** and rejects requests whose `Host`/`Origin` is not a loopback address. It has no authentication and can flash, erase, and read the memory of attached hardware, so it must never be exposed to a network. VS Code Remote SSH / WSL / Codespaces forward localhost, so those setups work unchanged.
 
-Each VS Code window runs its own server. The first window to activate takes `serverPort`; later windows fall back to an OS-assigned port, so a window never shares another window's debug session. In-editor agents (Copilot) discover the right port automatically via the registered `McpServerDefinitionProvider`.
+**Several windows are supported, and route correctly.** One window binds `serverPort` and becomes the *router*; every other window runs a token-gated loopback control server and publishes itself to a shared registry. The router forwards each tool call to the window that owns the target, so external CLI agents (Claude Code, Codex, Copilot CLI) — which read a single global config naming one URL — reach every window through it. In-editor Copilot points at the same endpoint, so both agree on which window owns the board. Closing the router promotes another window within ~10s.
 
-External CLI agents (Claude Code, Codex, Copilot CLI) read a single global config file, which can only name one URL — the most recently activated window wins. If you drive hardware from a CLI agent, keep one CMSIS-DebugMCP window open, or re-run **CMSIS-DebugMCP: Show Agent Selection Popup** from the window you want the agent to attach to.
+The router picks the target from a file path when the tool has one (`add_breakpoint`, `start_debugging`). Most tools here have none — `read_memory`, `cmsis_action`, `flash`, `reset`, the serial tools — so it falls back to the window with an active debug session, which is the usual one-window-one-board case.
+
+When **two windows are debugging at once** it refuses to guess and names both. Reading the wrong board's memory looks exactly like a firmware bug, so an error is cheaper. Use `list_debug_windows` and `select_debug_window` to pin one for the session.
+
+> Before v1.3.0 each window ran its own server on a fallback port and the last window to start overwrote the shared agent config — which is precisely how an agent ended up driving a window that did not hold the board.
 
 
 ## FAQ
