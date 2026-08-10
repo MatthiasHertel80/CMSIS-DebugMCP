@@ -4,6 +4,14 @@ All notable changes to CMSIS-DebugMCP will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.1] - 2026-08-10
+
+### Changed
+- **The extension is bundled with esbuild.** Ships one `dist/extension.js` plus `serialport`'s subtree instead of the whole production dependency tree: **2271 files / 14.7 MB → 246 files / 12.4 MB**. `serialport` stays external because `node-gyp-build` resolves its native `.node` relative to `__dirname` at runtime, so bundling it would break every serial tool. `test/transport/packaged-vsix.js` unpacks a built VSIX and checks the native binding really enumerates ports — that failure mode exists only in the packaged extension, never in development.
+
+### Fixed
+- **Compiled tests are no longer packaged.** `.vscodeignore` excluded `src/**` and `test/**` but not `out/test/**`, so every release up to 1.2.1 shipped compiled tests unnoticed. It surfaced when `vsce` refused to package 2.0.0: the redaction tests carry credential-shaped fixtures to prove those shapes get withheld, and the secret scanner found them in the VSIX.
+
 ## [2.0.0] - 2026-08-10
 
 Upstream sync: the fork was based on `microsoft/DebugMCP` `4422d8c` (2026-03-14) and had cherry-picked three commits since. Upstream is 102 commits ahead at v2.3.0. This release takes what applies to Cortex-M, adapts what does not, and says which is which.

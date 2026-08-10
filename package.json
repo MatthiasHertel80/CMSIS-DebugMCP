@@ -2,7 +2,7 @@
   "name": "cmsis-debugmcp",
   "displayName": "CMSIS-DebugMCP",
   "description": "AI-driven debugging for Arm Cortex-M targets via the CMSIS Debugger. MCP server with fault analysis, memory inspection, peripheral registers, and core register reads. Fork of microsoft/DebugMCP.",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "publisher": "mather01",
   "author": {
     "name": "Matthias Hertel",
@@ -53,7 +53,7 @@
     "onStartupFinished",
     "onDebug"
   ],
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "mcpServerDefinitionProviders": [
       {
@@ -92,7 +92,7 @@
         "cmsis-debugmcp.redactSecrets": {
           "type": "boolean",
           "default": true,
-          "markdownDescription": "Withhold variable and expression values whose name or content looks like a credential (API key, token, password, connection string) before they are sent to an AI agent. Numeric scalars are never withheld, so firmware flags and counters named `auth`, `token` or `key` stay readable. Raw target reads — `read_memory`, `read_core_registers`, `read_peripheral_register`, `get_fault_info`, and `-exec` GDB passthrough — are never redacted."
+          "markdownDescription": "Withhold variable and expression values whose name or content looks like a credential (API key, token, password, connection string) before they are sent to an AI agent. Numeric scalars are never withheld, so firmware flags and counters named `auth`, `token` or `key` stay readable. Raw target reads \u2014 `read_memory`, `read_core_registers`, `read_peripheral_register`, `get_fault_info`, and `-exec` GDB passthrough \u2014 are never redacted."
         },
         "cmsis-debugmcp.dapRequestTimeoutMs": {
           "type": "number",
@@ -110,14 +110,16 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run package",
     "compile": "tsc -p ./",
     "check-types": "tsc --noEmit -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
     "test": "vscode-test",
-    "test:transport": "npm run compile && node test/transport/session-lifecycle.js && node test/transport/two-window-routing.js"
+    "test:transport": "npm run compile && node test/transport/session-lifecycle.js && node test/transport/two-window-routing.js",
+    "bundle": "node esbuild.js",
+    "package": "npm run check-types && node esbuild.js --production"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
@@ -135,6 +137,7 @@
     "@typescript-eslint/parser": "^8.56.0",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
+    "esbuild": "^0.28.0",
     "eslint": "^10.0.1",
     "typescript": "^5.9.3"
   },

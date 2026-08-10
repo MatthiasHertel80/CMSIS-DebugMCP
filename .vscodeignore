@@ -2,14 +2,8 @@
 .vscode-test/**
 src/**
 test/**
-
-# Compiled tests. Never loaded by the extension, and shipping them put
-# credential-shaped fixtures from the redaction tests into the VSIX — which
-# vsce's secret scanner (correctly) refuses to package. Releases up to and
-# including 1.2.1 shipped out/test/ unnoticed, because the tests of the day
-# had no secret-shaped strings in them.
-out/test/**
-
+out/**
+dist/**/*.map
 .gitignore
 .yarnrc
 vsc-extension-quickstart.md
@@ -23,8 +17,27 @@ esbuild.js
 # extension or the marketplace readme. No reason to ship it to every user.
 assets/DebugMCP.mp4
 
-# NOTE: node_modules is deliberately NOT excluded. The extension ships as
-# unbundled out/*.js, so it still resolves express, the MCP SDK, zod and
-# serialport from the installed tree at runtime. Excluding node_modules only
-# becomes correct once the esbuild bundle in esbuild.js is switched on — see
-# docs/packaging-esbuild.md for the allow-list that has to go with it.
+# The extension is bundled into dist/extension.js by esbuild, so the production
+# dependency tree does not need to ship — except for serialport, which is
+# deliberately left external (see esbuild.js: node-gyp-build resolves its
+# native .node binary relative to __dirname at runtime, so bundling it breaks
+# every serial tool).
+#
+# This allow-list is serialport's full transitive closure, derived from the
+# installed tree rather than guessed. Regenerate after a serialport upgrade:
+#
+#   node -e "const s=new Set();(function w(p){if(s.has(p))return;s.add(p);
+#     let j;try{j=require('./node_modules/'+p+'/package.json')}catch(e){return}
+#     for(const d of Object.keys(j.dependencies||{}))w(d)})('serialport');
+#     console.log([...s].sort().join('\n'))"
+#
+# Getting this wrong fails at runtime in the packaged extension only — never in
+# development, where the whole tree is present. test/transport/packaged-vsix.js
+# unpacks the built VSIX and loads serialport from it, which is what catches it.
+node_modules/**
+!node_modules/serialport/**
+!node_modules/@serialport/**
+!node_modules/node-addon-api/**
+!node_modules/node-gyp-build/**
+!node_modules/debug/**
+!node_modules/ms/**
