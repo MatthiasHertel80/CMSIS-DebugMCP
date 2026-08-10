@@ -2,6 +2,14 @@
 .vscode-test/**
 src/**
 test/**
+
+# Compiled tests. Never loaded by the extension, and shipping them put
+# credential-shaped fixtures from the redaction tests into the VSIX — which
+# vsce's secret scanner (correctly) refuses to package. Releases up to and
+# including 1.2.1 shipped out/test/ unnoticed, because the tests of the day
+# had no secret-shaped strings in them.
+out/test/**
+
 .gitignore
 .yarnrc
 vsc-extension-quickstart.md
