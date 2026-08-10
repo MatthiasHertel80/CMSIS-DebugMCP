@@ -681,12 +681,21 @@ export class AgentConfigurationManager {
     /**
      * Copy the bundled skill into the standard personal skills directories.
      *
+     * Called on every activation, not just on agent registration. The skill is
+     * agent-independent — it lives in one shared location per the Agent Skills
+     * standard — so gating it on "the user picked an agent from the popup"
+     * meant an existing user upgrading the extension never received it: they
+     * already registered their agents releases ago and never open that dialog
+     * again.
+     *
+     * Overwrites unconditionally so the skill tracks the installed extension
+     * version rather than drifting behind it. It is five files, ~24 KB.
+     *
      * Returns the primary destination, or null when nothing was installed.
-     * Every failure is logged and skipped: the user asked to register an MCP
-     * server, and not being able to write a skill file is not a reason to fail
-     * that.
+     * Every failure is logged and skipped: not being able to write a skill file
+     * must never take activation (or an agent registration) down with it.
      */
-    private async installCmsisDebugSkill(): Promise<string | null> {
+    public async installCmsisDebugSkill(): Promise<string | null> {
         const bundledSkillPath = this.getBundledSkillPath();
 
         if (!fs.existsSync(bundledSkillPath)) {

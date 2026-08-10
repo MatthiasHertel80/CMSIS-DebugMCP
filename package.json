@@ -2,7 +2,7 @@
   "name": "cmsis-debugmcp",
   "displayName": "CMSIS-DebugMCP",
   "description": "AI-driven debugging for Arm Cortex-M targets via the CMSIS Debugger. MCP server with fault analysis, memory inspection, peripheral registers, and core register reads. Fork of microsoft/DebugMCP.",
-  "version": "2.0.1",
+  "version": "2.0.2",
   "publisher": "mather01",
   "author": {
     "name": "Matthias Hertel",

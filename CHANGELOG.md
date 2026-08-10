@@ -4,6 +4,11 @@ All notable changes to CMSIS-DebugMCP will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.2] - 2026-08-10
+
+### Fixed
+- **The bundled agent skill is now actually installed.** It shipped inside the VSIX but was only copied to `~/.agents/skills/` from `configureAgent()` — the agent-registration dialog. Anyone who registered their agents in an earlier release never opens that dialog again, so upgrading delivered the skill to nobody. It is agent-independent by design, so it now installs on activation and overwrites, keeping it in step with the installed extension version instead of drifting behind it.
+
 ## [2.0.1] - 2026-08-10
 
 ### Changed

@@ -42,6 +42,20 @@ export async function activate(context: vscode.ExtensionContext) {
     // Initialize Agent Configuration Manager
     agentConfigManager = new AgentConfigurationManager(context, timeoutInSeconds, serverPort);
 
+    // Put the bundled agent skill where skills-aware harnesses look for it.
+    // Done here rather than only on agent registration: the skill is
+    // agent-independent, and a user who registered their agents in an earlier
+    // release never opens that dialog again — so gating it there meant every
+    // upgrading user silently got no skill.
+    try {
+        const skillPath = await agentConfigManager.installCmsisDebugSkill();
+        logger.info(skillPath
+            ? `Installed the cmsis-debug-live agent skill at ${skillPath}`
+            : 'No agent skill was installed (bundle missing or skills dir unwritable)');
+    } catch (error) {
+        logger.error('Error installing the agent skill', error);
+    }
+
     // Start this window's coordinator: it always runs a control server and
     // publishes the window to the shared registry, then tries to claim the
     // well-known port. Exactly one window wins and serves MCP; the rest execute
