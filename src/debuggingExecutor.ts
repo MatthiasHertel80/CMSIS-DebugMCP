@@ -489,36 +489,18 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 const activeStackItem = vscode.debug.activeStackItem;
                 if (activeStackItem && 'frameId' in activeStackItem) {
                     state.updateContext(activeStackItem.frameId, activeStackItem.threadId);
-                    
-                    // Extract frame name from stack frame
-                    await this.extractFrameName(activeSession, activeStackItem.frameId, state);
-                    
-                    // Get the active editor
-                    const activeEditor = vscode.window.activeTextEditor;
-                    if (activeEditor) {
-                        const fileName = activeEditor.document.fileName.split(/[/\\]/).pop() || '';
-                        const currentLine = activeEditor.selection.active.line + 1; // 1-based line number
-                        const currentLineContent = activeEditor.document.lineAt(activeEditor.selection.active.line).text.trim();
-                        
-                        // Get next non-empty lines
-                        const nextLines = [];
-                        let lineOffset = 1;
-                        while (nextLines.length < numNextLines && 
-                               activeEditor.selection.active.line + lineOffset < activeEditor.document.lineCount) {
-                            const lineText = activeEditor.document.lineAt(activeEditor.selection.active.line + lineOffset).text.trim();
-                            if (lineText.length > 0) {
-                                nextLines.push(lineText);
-                            }
-                            lineOffset++;
-                        }
-                        
-                        state.updateLocation(
-                            activeEditor.document.fileName,
-                            fileName,
-                            currentLine,
-                            currentLineContent,
-                            nextLines
-                        );
+
+                    // Take the current location from the debug adapter's top
+                    // stack frame rather than the active text editor. VS Code
+                    // moves the editor cursor asynchronously after a stop, and
+                    // only for the focused editor — reading it here lagged the
+                    // actual stop and reported the wrong file whenever focus was
+                    // elsewhere. On a gdbtarget session the editor may not track
+                    // the target at all. The DAP frame is ground truth.
+                    const topFrame = await this.extractFrameName(activeSession, activeStackItem.frameId, state);
+
+                    if (topFrame?.path && typeof topFrame.line === 'number') {
+                        await this.populateLocationFromFrame(state, topFrame.path, topFrame.line, numNextLines);
                     }
                 }
             }
@@ -541,9 +523,17 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     }
 
     /**
-     * Extract frame name and stack trace from the current debug session
+     * Extract frame name and stack trace from the current debug session.
+     *
+     * Returns the top frame's source location so the caller can report the
+     * authoritative current position without scraping the editor. Returns
+     * undefined when no stack frame is available.
      */
-    private async extractFrameName(session: vscode.DebugSession, frameId: number, state: DebugState): Promise<void> {
+    private async extractFrameName(
+        session: vscode.DebugSession,
+        frameId: number,
+        state: DebugState
+    ): Promise<{ path?: string; line?: number; column?: number } | undefined> {
         try {
             // Get full stack trace (up to 50 frames)
             const stackTraceResponse = await customRequestWithTimeout<any>(session, 'stackTrace', {
@@ -566,12 +556,59 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 }));
 
                 state.updateStackTrace(stackTrace);
+
+                // DAP line/column are 1-based (VS Code's default). Hand the raw
+                // top-frame location back for location reporting.
+                return {
+                    path: currentFrame.source?.path,
+                    line: currentFrame.line,
+                    column: currentFrame.column,
+                };
             }
         } catch (error) {
             console.log('Unable to extract stack info:', error);
             // Set empty values on error
             state.updateFrameName(null);
             state.updateStackTrace([]);
+        }
+        return undefined;
+    }
+
+    /**
+     * Populate the DebugState location (file, current line + content, and the
+     * next few non-empty lines) by reading the source document at the debugger's
+     * current frame line. Uses the DAP-reported path/line rather than the active
+     * editor, so it is accurate regardless of which editor (if any) has focus.
+     */
+    private async populateLocationFromFrame(
+        state: DebugState,
+        filePath: string,
+        line: number,
+        numNextLines: number
+    ): Promise<void> {
+        try {
+            const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+            const zeroBasedLine = Math.max(0, Math.min(line - 1, doc.lineCount - 1));
+            const fileName = filePath.split(/[/\\]/).pop() || '';
+            const currentLineContent = doc.lineAt(zeroBasedLine).text.trim();
+
+            // Collect the next non-empty lines for lookahead context.
+            const nextLines: string[] = [];
+            let lineOffset = 1;
+            while (nextLines.length < numNextLines && zeroBasedLine + lineOffset < doc.lineCount) {
+                const lineText = doc.lineAt(zeroBasedLine + lineOffset).text.trim();
+                if (lineText.length > 0) {
+                    nextLines.push(lineText);
+                }
+                lineOffset++;
+            }
+
+            state.updateLocation(filePath, fileName, line, currentLineContent, nextLines);
+        } catch (error) {
+            // Firmware stops in assembly, ROM, or a library the workspace has no
+            // source for — very common on Cortex-M. Degrade gracefully and leave
+            // the location unset rather than failing the whole state read.
+            console.log('Unable to read frame source document:', error);
         }
     }
 
