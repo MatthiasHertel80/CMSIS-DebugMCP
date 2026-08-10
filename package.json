@@ -89,6 +89,11 @@
           "default": 3001,
           "description": "Port number for the CMSIS-DebugMCP server"
         },
+        "cmsis-debugmcp.redactSecrets": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "Withhold variable and expression values whose name or content looks like a credential (API key, token, password, connection string) before they are sent to an AI agent. Numeric scalars are never withheld, so firmware flags and counters named `auth`, `token` or `key` stay readable. Raw target reads — `read_memory`, `read_core_registers`, `read_peripheral_register`, `get_fault_info`, and `-exec` GDB passthrough — are never redacted."
+        },
         "cmsis-debugmcp.dapRequestTimeoutMs": {
           "type": "number",
           "default": 10000,

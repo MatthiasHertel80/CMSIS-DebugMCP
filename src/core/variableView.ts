@@ -9,6 +9,8 @@
  * ones the spec marks optional.
  */
 
+import { REDACTION_NOTICE } from '../utils/secretRedaction';
+
 export interface DapVariable {
     name: string;
     value: string;
@@ -80,13 +82,23 @@ export function selectVariables(
     return { scopes: filtered, missing: wanted.filter(name => !found.has(name)) };
 }
 
-/** Render scopes and their variables as the value listing an agent reads. */
+/**
+ * Render scopes and their variables as the value listing an agent reads.
+ *
+ * `redact` is injected rather than imported so this module stays a pure
+ * formatter and the redaction policy remains testable on its own.
+ */
 export function renderScopes(
     scopes: DapScope[],
-    options: { header: string; emptyScopeText?: string } = { header: 'Variables' },
+    options: {
+        header: string;
+        emptyScopeText?: string;
+        redact?: (name: string, value: string) => { value: string; redacted: boolean };
+    } = { header: 'Variables' },
 ): string {
     const emptyScopeText = options.emptyScopeText ?? '  No variables in this scope';
     let out = `${options.header}:\n==========\n\n`;
+    let anyRedacted = false;
 
     for (const scope of scopes) {
         out += `${scope.name}:\n`;
@@ -94,7 +106,13 @@ export function renderScopes(
             out += `  Error retrieving variables: ${scope.error}\n`;
         } else if (scope.variables && scope.variables.length > 0) {
             for (const variable of scope.variables) {
-                out += `  ${variable.name}: ${variable.value}`;
+                let shown = variable.value;
+                if (options.redact) {
+                    const verdict = options.redact(variable.name, variable.value);
+                    shown = verdict.value;
+                    anyRedacted ||= verdict.redacted;
+                }
+                out += `  ${variable.name}: ${shown}`;
                 if (variable.type) { out += ` (${variable.type})`; }
                 out += '\n';
             }
@@ -104,7 +122,7 @@ export function renderScopes(
         out += '\n';
     }
 
-    return out;
+    return anyRedacted ? `${out}${REDACTION_NOTICE}\n` : out;
 }
 
 /**

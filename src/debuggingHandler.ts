@@ -8,6 +8,7 @@ import { DebugState, formatBreakpointModifiers } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { HardwareTimeoutError, withTimeout } from './utils/timeout';
 import { fileExists, flashWithPyocd, probePyocd } from './core/flashController';
+import { redactExpressionResult, redactVariableValue, REDACTION_NOTICE } from './utils/secretRedaction';
 import {
     DapScope,
     formatMissingNames,
@@ -119,6 +120,27 @@ export class DebuggingHandler implements IDebuggingHandler {
         timeoutInSeconds: number
     ) {
         this.timeoutInSeconds = timeoutInSeconds;
+    }
+
+    /**
+     * The redaction callback to hand to the variable renderer, or undefined
+     * when redaction is off.
+     *
+     * Read per call rather than cached at construction so toggling the setting
+     * takes effect without a window reload. Only the *symbolic* paths are
+     * gated: read_memory, read_core_registers, read_peripheral_register and
+     * get_fault_info deliberately never pass through here. Those return raw
+     * target state, and several SVDs name real registers KEY, KR or UNLOCK
+     * (watchdog and flash-controller unlock registers) — withholding them
+     * would break exactly the debugging they exist for, and a memory-mapped
+     * register is not a credential.
+     */
+    private redactor(): ((name: string, value: string) => { value: string; redacted: boolean }) | undefined {
+        const enabled = vscode.workspace
+            .getConfiguration('cmsis-debugmcp')
+            .get<boolean>('redactSecrets', true);
+        if (!enabled) { return undefined; }
+        return (name, value) => redactVariableValue(name, value);
     }
 
     /**
@@ -949,7 +971,7 @@ export class DebuggingHandler implements IDebuggingHandler {
                     'Call list_variable_names to see what is available here.';
             }
 
-            out += renderScopes(selected, { header: 'Variables' });
+            out += renderScopes(selected, { header: 'Variables', redact: this.redactor() });
             out += formatMissingNames(missing);
             return out;
         });
@@ -972,10 +994,24 @@ export class DebuggingHandler implements IDebuggingHandler {
             const response = await this.executor.evaluateExpression(expression, activeStackItem.frameId, timeoutMs);
 
             if (response && response.result !== undefined) {
+                // evaluate_expression is the trivial bypass for per-variable
+                // redaction — `os.environ` or a bare `apiKey` returns the same
+                // value the variable view withheld. Raw GDB CLI passthrough is
+                // exempt: `-exec info registers` and friends return target
+                // state, not program values, and must come back verbatim.
+                const isGdbPassthrough = expression.trimStart().startsWith('-exec');
+                const redact = this.redactor();
+                const verdict = (redact && !isGdbPassthrough)
+                    ? redactExpressionResult(expression, response.result)
+                    : { value: String(response.result), redacted: false };
+
                 let resultText = `Expression: ${expression}\n`;
-                resultText += `Result: ${response.result}`;
+                resultText += `Result: ${verdict.value}`;
                 if (response.type) {
                     resultText += ` (${response.type})`;
+                }
+                if (verdict.redacted) {
+                    resultText += `\n\n${REDACTION_NOTICE}`;
                 }
 
                 return resultText;
@@ -1457,7 +1493,7 @@ REQUIRED NEXT STEPS:
                 return `None of the requested variables are in scope at frameId=${frameId}: ${variableNames.join(', ')}.`;
             }
 
-            return renderScopes(selected, { header: `Variables for frameId=${frameId}` })
+            return renderScopes(selected, { header: `Variables for frameId=${frameId}`, redact: this.redactor() })
                 + formatMissingNames(missing);
         });
     }

@@ -8,6 +8,7 @@ import {
     renderVariableNames,
     selectVariables,
 } from '../core/variableView';
+import { redactVariableValue } from '../utils/secretRedaction';
 
 const scopes = (): DapScope[] => ([
     {
@@ -128,5 +129,42 @@ suite('Variable rendering', () => {
         const note = formatMissingNames(['foo', 'bar']);
         assert.match(note, /foo, bar/);
         assert.match(note, /list_variable_names/);
+    });
+});
+
+suite('Variable rendering with redaction', () => {
+
+    const withSecret = (): DapScope[] => ([{
+        name: 'Local',
+        variables: [
+            { name: 'adc_raw', value: '2048', type: 'uint16_t' },
+            { name: 'apiKey', value: '"sk-abcdefghijklmnopqrst"', type: 'char *' },
+        ],
+    }]);
+
+    test('no redactor means values pass through verbatim', () => {
+        const out = renderScopes(withSecret(), { header: 'Variables' });
+        assert.match(out, /sk-abcdefghijklmnopqrst/);
+        assert.doesNotMatch(out, /NOTE: values matching/);
+    });
+
+    test('a redactor withholds the value and appends the notice once', () => {
+        const out = renderScopes(withSecret(), {
+            header: 'Variables',
+            redact: (name, value) => redactVariableValue(name, value),
+        });
+        assert.doesNotMatch(out, /sk-abcdefghijklmnopqrst/);
+        assert.match(out, /apiKey: <redacted: possible secret>/);
+        assert.match(out, /adc_raw: 2048/, 'unrelated variables stay readable');
+        assert.strictEqual(out.match(/NOTE: values matching/g)?.length, 1);
+    });
+
+    test('the notice is omitted when nothing was actually withheld', () => {
+        const clean: DapScope[] = [{ name: 'Local', variables: [{ name: 'ticks', value: '99' }] }];
+        const out = renderScopes(clean, {
+            header: 'Variables',
+            redact: (name, value) => redactVariableValue(name, value),
+        });
+        assert.doesNotMatch(out, /NOTE: values matching/);
     });
 });
