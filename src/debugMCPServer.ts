@@ -55,6 +55,17 @@ export function isLoopbackOrigin(origin: string): boolean {
 }
 
 /**
+ * The configured port is already served, so another window is the router.
+ * Routine, not a failure — every window after the first hits this.
+ */
+export class PortInUseError extends Error {
+    constructor(public readonly port: number) {
+        super(`Port ${port} is already in use by another CMSIS-DebugMCP window`);
+        this.name = 'PortInUseError';
+    }
+}
+
+/**
  * How a session reaches the serial backends. Indirected through an op name
  * rather than calling the singleton, because in the multi-window setup the
  * board's USB-serial port is owned by the window that has the board — not by
@@ -1041,9 +1052,15 @@ export class DebugMCPServer {
                 });
             });
 
-            // Try the configured port first; fall back to an OS-assigned port
-            // so multiple IDE windows each get their own server.
-            this.httpServer = await this.listenWithFallback(app, this.port);
+            // Bind the configured port. There is deliberately no fallback to an
+            // OS-assigned port: that fallback is what produced the misrouting.
+            // Every window got its own server, agentConfigurationManager wrote
+            // whichever port this window happened to receive, and the last
+            // window to start won — so the agent's single MCP URL pointed at an
+            // arbitrary window rather than the one holding the board. Losing the
+            // bind now means "another window is the router", and the caller
+            // makes this window a worker instead.
+            this.httpServer = await this.listenOnce(app, this.port, LOOPBACK_BIND_ADDRESS);
 
             // The port is read back from the bound socket, never assumed from
             // `this.port` — a wrong value here would make us advertise another
@@ -1062,6 +1079,13 @@ export class DebugMCPServer {
             logger.info(`CMSIS-DebugMCP server started successfully on 127.0.0.1:${this.actualPort}`);
 
         } catch (error) {
+            if ((error as NodeJS.ErrnoException)?.code === 'EADDRINUSE') {
+                // Expected whenever a second window opens: another window is
+                // already the router. Distinguishable so the caller can become
+                // a worker rather than reporting a failure to the user.
+                logger.info(`Port ${this.port} is already served — this window will be a worker`);
+                throw new PortInUseError(this.port);
+            }
             logger.error(`Failed to start CMSIS-DebugMCP server`, error);
             throw new Error(`Failed to start CMSIS-DebugMCP server: ${error}`);
         }
@@ -1093,28 +1117,6 @@ export class DebugMCPServer {
             server.once('listening', onListening);
             server.once('error', onError);
         });
-    }
-
-    /**
-     * Try to listen on preferredPort. If it is already in use, let the OS
-     * assign a free port (port 0) so multiple IDE windows each get their own
-     * server instead of silently sharing one.
-     *
-     * Binds the loopback interface only — this server exposes flash, memory
-     * and GDB access with no authentication, and must never be reachable
-     * from the network. (VS Code Remote / WSL port forwarding operates on
-     * localhost, so remote setups keep working.)
-     */
-    private async listenWithFallback(app: ReturnType<typeof express>, preferredPort: number): Promise<http.Server> {
-        try {
-            return await this.listenOnce(app, preferredPort, LOOPBACK_BIND_ADDRESS);
-        } catch (err) {
-            if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') {
-                throw err;
-            }
-            logger.warn(`Port ${preferredPort} already in use – requesting OS-assigned port`);
-            return await this.listenOnce(app, 0, LOOPBACK_BIND_ADDRESS);
-        }
     }
 
     /**

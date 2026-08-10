@@ -106,8 +106,14 @@ export class AgentConfigurationManager {
     }
 
     /**
-     * Update the server port (e.g. after the OS assigned a free port).
-     * Call this before writing any agent configurations.
+     * Set the port written into agent configurations.
+     *
+     * Always the well-known router port, in every window. It used to be
+     * whichever port this window's own server managed to bind, so the last
+     * window to start overwrote the shared agent config and pointed the agent
+     * at an arbitrary window. Now one window serves that port and forwards
+     * each call to the window that owns the target, so every window writing
+     * the same value is correct and idempotent.
      */
     public updatePort(port: number): void {
         this.serverPort = port;
