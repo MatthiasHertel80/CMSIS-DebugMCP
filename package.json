@@ -112,10 +112,12 @@
   "scripts": {
     "vscode:prepublish": "npm run compile",
     "compile": "tsc -p ./",
+    "check-types": "tsc --noEmit -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src",
-    "test": "vscode-test"
+    "test": "vscode-test",
+    "test:transport": "npm run compile && node test/transport/session-lifecycle.js && node test/transport/two-window-routing.js"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",

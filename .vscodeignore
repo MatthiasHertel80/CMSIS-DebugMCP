@@ -1,9 +1,11 @@
 .vscode/**
 .vscode-test/**
 src/**
+test/**
 .gitignore
 .yarnrc
 vsc-extension-quickstart.md
+esbuild.js
 **/tsconfig.json
 **/eslint.config.mjs
 **/*.map
@@ -12,3 +14,9 @@ vsc-extension-quickstart.md
 # 15 MB demo video: referenced from the GitHub repo, never by the packaged
 # extension or the marketplace readme. No reason to ship it to every user.
 assets/DebugMCP.mp4
+
+# NOTE: node_modules is deliberately NOT excluded. The extension ships as
+# unbundled out/*.js, so it still resolves express, the MCP SDK, zod and
+# serialport from the installed tree at runtime. Excluding node_modules only
+# becomes correct once the esbuild bundle in esbuild.js is switched on — see
+# docs/packaging-esbuild.md for the allow-list that has to go with it.
