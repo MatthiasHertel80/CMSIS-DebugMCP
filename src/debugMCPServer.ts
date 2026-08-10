@@ -14,6 +14,7 @@ import {
 import { HardwareTimeouts, SERVER_VERSION } from './debuggingExecutor';
 import { logger } from './utils/logger';
 import { serialHandler } from './serialHandler';
+import { SerialOpName } from './core/opTable';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -54,6 +55,48 @@ export function isLoopbackOrigin(origin: string): boolean {
 }
 
 /**
+ * How a session reaches the serial backends. Indirected through an op name
+ * rather than calling the singleton, because in the multi-window setup the
+ * board's USB-serial port is owned by the window that has the board — not by
+ * whichever window happens to be running the router.
+ */
+export type SerialDispatch = (op: SerialOpName, args?: unknown) => Promise<string>;
+
+/** The pair of handlers one MCP session talks to. */
+export interface SessionHandlers {
+    debug: IDebuggingHandler;
+    serial: SerialDispatch;
+}
+
+/**
+ * True when this session's handler forwards to other windows.
+ *
+ * A structural check rather than `instanceof RoutingDebuggingHandler`: importing
+ * the router here would make debugMCPServer depend on the routing layer even in
+ * the single-window build, and these two methods are exactly the contract the
+ * routing tools need.
+ */
+function isRoutingHandler(
+    handler: IDebuggingHandler,
+): handler is IDebuggingHandler & {
+    listDebugWindows(): string;
+    selectDebugWindow(args: { pid?: number; workspaceFolder?: string }): string;
+} {
+    const h = handler as unknown as Record<string, unknown>;
+    return typeof h.listDebugWindows === 'function' && typeof h.selectDebugWindow === 'function';
+}
+
+/** Single-window dispatch: straight to the local serial handler singleton. */
+export const localSerialDispatch: SerialDispatch = (op, args) => {
+    const target = serialHandler as unknown as Record<string, unknown>;
+    const method = target[op];
+    if (typeof method !== 'function') {
+        return Promise.reject(new Error(`Serial op ${op} is not implemented`));
+    }
+    return Promise.resolve((method as (a?: unknown) => Promise<string>).call(serialHandler, args));
+};
+
+/**
  * Main MCP server class that exposes debugging functionality as tools and resources.
  * Uses the official @modelcontextprotocol/sdk with SSE transport over express.
  */
@@ -68,7 +111,7 @@ export class DebugMCPServer {
      * each agent session keep its own routing target (which VS Code window owns
      * the board) once the routing handler is wired in.
      */
-    private handlerFactory: () => IDebuggingHandler;
+    private handlerFactory: () => SessionHandlers;
 
     /**
      * Live Streamable-HTTP transports keyed by MCP session id. A transport is
@@ -81,16 +124,17 @@ export class DebugMCPServer {
         port: number,
         timeoutInSeconds: number,
         hardwareTimeouts?: Partial<HardwareTimeouts>,
-        handlerFactory?: () => IDebuggingHandler,
+        handlerFactory?: () => SessionHandlers,
     ) {
         if (handlerFactory) {
             this.handlerFactory = handlerFactory;
         } else {
-            // Single-window default: debug in this very window.
+            // Single-window default: debug in this very window, and drive the
+            // serial backends directly rather than over a control server.
             const executor = new DebuggingExecutor(hardwareTimeouts);
             const configManager = new ConfigurationManager();
             const handler = new DebuggingHandler(executor, configManager, timeoutInSeconds);
-            this.handlerFactory = () => handler;
+            this.handlerFactory = () => ({ debug: handler, serial: localSerialDispatch });
         }
         this.port = port;
     }
@@ -119,7 +163,8 @@ export class DebugMCPServer {
             name: 'cmsis-debugmcp',
             version: SERVER_VERSION,
         });
-        this.setupTools(mcpServer, this.handlerFactory());
+        const handlers = this.handlerFactory();
+        this.setupTools(mcpServer, handlers.debug, handlers.serial);
         this.setupResources(mcpServer);
         return mcpServer;
     }
@@ -131,7 +176,11 @@ export class DebugMCPServer {
      * MCP session gets its own — in the multi-window setup that handler
      * carries the session's routing target.
      */
-    private setupTools(mcpServer: McpServer, debuggingHandler: IDebuggingHandler) {
+    private setupTools(
+        mcpServer: McpServer,
+        debuggingHandler: IDebuggingHandler,
+        serial: SerialDispatch,
+    ) {
         const TIMEOUT_DESC = 'Optional per-call timeout in milliseconds (capped to 60 000). Overrides the default for this single tool call. Use it when you can estimate the work and want a tighter or looser bound.';
 
         // Get debug instructions tool (for clients that don't support MCP resources like GitHub Copilot)
@@ -550,7 +599,7 @@ export class DebugMCPServer {
                 'falls back to the bundled serialport library.',
             annotations: { readOnlyHint: true, destructiveHint: false },
         }, async () => {
-            const result = await serialHandler.handleListPorts();
+            const result = await serial('handleListPorts');
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -567,14 +616,14 @@ export class DebugMCPServer {
                 rtscts: z.boolean().optional().describe('RTS/CTS hardware flow control (default false)'),
             },
         }, async (args: { path: string; baudRate?: number; dataBits?: 5 | 6 | 7 | 8; parity?: 'none' | 'even' | 'odd' | 'mark' | 'space'; stopBits?: 1 | 1.5 | 2; rtscts?: boolean }) => {
-            const result = await serialHandler.handleOpen(args);
+            const result = await serial('handleOpen', args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         mcpServer.registerTool('serial_close', {
             description: 'Close the OWNED serial port (does not affect the MS Serial Monitor UI).',
         }, async () => {
-            const result = await serialHandler.handleClose();
+            const result = await serial('handleClose');
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -584,7 +633,7 @@ export class DebugMCPServer {
                 'Includes the discovered API keys so you can see what MS exposes in the installed build.',
             annotations: { readOnlyHint: true, destructiveHint: false },
         }, async () => {
-            const result = await serialHandler.handleStatus();
+            const result = await serial('handleStatus');
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -596,7 +645,7 @@ export class DebugMCPServer {
                 appendNewline: z.boolean().optional().describe("Append '\\n' to utf8 payloads (default false)"),
             },
         }, async (args: { data: string; encoding?: 'utf8' | 'hex'; appendNewline?: boolean }) => {
-            const result = await serialHandler.handleWrite(args);
+            const result = await serial('handleWrite', args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -614,7 +663,7 @@ export class DebugMCPServer {
                 from: z.enum(['owned', 'monitor']).optional().describe("Backend to read from (default 'owned')"),
             },
         }, async (args: { maxBytes?: number; waitMs?: number; consume?: boolean; format?: 'utf8' | 'hex' | 'both'; from?: 'owned' | 'monitor' }) => {
-            const result = await serialHandler.handleRead(args);
+            const result = await serial('handleRead', args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -624,7 +673,7 @@ export class DebugMCPServer {
                 from: z.enum(['owned', 'monitor']).optional(),
             },
         }, async (args: { from?: 'owned' | 'monitor' }) => {
-            const result = await serialHandler.handleClearBuffer(args);
+            const result = await serial('handleClearBuffer', args);
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -636,14 +685,14 @@ export class DebugMCPServer {
                 'event yet, returns a clear error and you should fall back to serial_open (owned port). ' +
                 "After subscribing, read with serial_read from='monitor'.",
         }, async () => {
-            const result = await serialHandler.handleSubscribeMonitor();
+            const result = await serial('handleSubscribeMonitor');
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
         mcpServer.registerTool('serial_unsubscribe_monitor', {
             description: 'Stop the Serial Monitor data subscription (the user\'s UI session is unaffected).',
         }, async () => {
-            const result = await serialHandler.handleUnsubscribeMonitor();
+            const result = await serial('handleUnsubscribeMonitor');
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -652,7 +701,7 @@ export class DebugMCPServer {
                 'session. UI-only — does not open or read a port. Pair with serial_subscribe_monitor to also ' +
                 'feed bytes back to the agent.',
         }, async () => {
-            const result = await serialHandler.handleOpenInUi();
+            const result = await serial('handleOpenInUi');
             return { content: [{ type: 'text' as const, text: result }] };
         });
 
@@ -726,6 +775,36 @@ export class DebugMCPServer {
             const result = await debuggingHandler.handleGetSessionStatus();
             return { content: [{ type: 'text' as const, text: result }] };
         });
+
+        // ========== Multi-window routing ==========
+        //
+        // Only registered when this server is actually routing. In a
+        // single-window setup there is nothing to choose between, and offering
+        // the tools would just invite the agent to reason about a non-problem.
+        if (isRoutingHandler(debuggingHandler)) {
+            const router = debuggingHandler;
+
+            mcpServer.registerTool('list_debug_windows', {
+                description: 'List the VS Code windows this MCP server can drive, with their workspace folders, ' +
+                    'whether each has an active debug session, and which one this session is currently targeting. ' +
+                    'Use it when a tool reports an ambiguous target, or when you suspect you are driving the wrong board.',
+                annotations: { readOnlyHint: true, destructiveHint: false },
+            }, async () => {
+                return { content: [{ type: 'text' as const, text: router.listDebugWindows() }] };
+            });
+
+            mcpServer.registerTool('select_debug_window', {
+                description: 'Pin this session to one VS Code window, by process id or by a path inside its workspace. ' +
+                    'Every subsequent tool call runs in that window. Needed when several windows are open and more ' +
+                    'than one has a debug session, since the server refuses to guess which board you mean.',
+                inputSchema: {
+                    pid: z.number().int().optional().describe('Process id of the window, as reported by list_debug_windows.'),
+                    workspaceFolder: z.string().optional().describe('Any path inside the target window\'s workspace folder.'),
+                },
+            }, async (args: { pid?: number; workspaceFolder?: string }) => {
+                return { content: [{ type: 'text' as const, text: router.selectDebugWindow(args) }] };
+            });
+        }
     }
 
     /**
@@ -1095,7 +1174,7 @@ export class DebugMCPServer {
      * Build a handler the way a new MCP session would (for testing purposes).
      */
     getDebuggingHandler(): IDebuggingHandler {
-        return this.handlerFactory();
+        return this.handlerFactory().debug;
     }
 
     /**
