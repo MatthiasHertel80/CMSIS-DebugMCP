@@ -1811,8 +1811,9 @@ REQUIRED NEXT STEPS:
                     `CMSIS extension (a multi-core flash + attach typically takes 20-40 s). This tool does not ` +
                     `block for the whole pipeline — poll get_session_status until it reports 'running' or ` +
                     `'stopped'. If get_session_status keeps reporting 'no-session' with liveSessionsInThisWindow=0, ` +
-                    `the CMSIS panel may be showing a picker the user must resolve, or the debug session is in a ` +
-                    `different VS Code window than this MCP server.`;
+                    `the CMSIS panel is most likely showing a picker the user must resolve. Less often, this call ` +
+                    `and the poll landed in different windows — check with list_debug_windows and pin one with ` +
+                    `select_debug_window.`;
             }
 
             // build / load / erase / load_and_run — wait for the cbuild/flash
@@ -1951,11 +1952,12 @@ REQUIRED NEXT STEPS:
             case 'no-session':
                 if (diag.liveSessionCount === 0) {
                     lines.push(
-                        'Hint: no debug session is visible to THIS extension host. Either no session is ' +
-                        'running, OR the debug session is in a different VS Code window (each window runs ' +
-                        'its own extension host + MCP server — they cannot see each other). Confirm the ' +
-                        'debug session and this MCP server are in the same VS Code window. If you just ' +
-                        'reinstalled the extension, reload the window so the new build is active.'
+                        'Hint: no debug session is running in the VS Code window this call was routed to. ' +
+                        'Start one with cmsis_action load_and_debug (CMSIS targets) or start_debugging. ' +
+                        'If a session IS running and you expected to reach it, it is in a different ' +
+                        'window: call list_debug_windows to see which windows are registered and which ' +
+                        'one holds the session, then select_debug_window to pin it for this session. ' +
+                        'If you just reinstalled the extension, reload the window so the new build is active.'
                     );
                 } else {
                     lines.push('Hint: call start_debugging or cmsis_action load_and_debug to attach.');
