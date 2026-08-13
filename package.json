@@ -35,7 +35,9 @@
     "gdbtarget"
   ],
   "engines": {
-    "vscode": "^1.104.0"
+    "node": "^22.22.0",
+    "npm": "^10.0.0",
+    "vscode": "^1.109.0"
   },
   "icon": "assets/debug_mcp_icon.png",
   "categories": [
