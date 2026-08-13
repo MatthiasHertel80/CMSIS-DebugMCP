@@ -3,11 +3,7 @@
   "displayName": "CMSIS-DebugMCP",
   "description": "AI-driven debugging for Arm Cortex-M targets via the CMSIS Debugger. MCP server with fault analysis, memory inspection, peripheral registers, and core register reads. Fork of microsoft/DebugMCP.",
   "version": "2.0.3",
-  "publisher": "mather01",
-  "author": {
-    "name": "Matthias Hertel",
-    "email": "matthias.hertel@arm.com"
-  },
+  "publisher": "arm",
   "license": "MIT",
   "homepage": "https://github.com/mather01/DebugMCP",
   "bugs": {
@@ -112,8 +108,8 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run package",
     "compile": "tsc -p ./",
+    "build": "npm run check-types && node esbuild.js --production",
     "check-types": "tsc --noEmit -p ./",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile && npm run lint",
@@ -121,7 +117,9 @@
     "test": "vscode-test",
     "test:transport": "npm run compile && node test/transport/session-lifecycle.js && node test/transport/two-window-routing.js",
     "bundle": "node esbuild.js",
-    "package": "npm run check-types && node esbuild.js --production"
+    "package": "npm run build && tsx scripts/package.ts",
+    "tpip:update": "tsx scripts/update-tpip docs/third-party-licenses.json",
+    "tpip:report": "tsx scripts/tpip-reporter --header docs/tpip-header.md docs/third-party-licenses.json TPIP.md"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.26.0",
@@ -134,14 +132,20 @@
   "devDependencies": {
     "@types/mocha": "^10.0.10",
     "@types/node": "^25.3.0",
+    "@types/semver": "^7.7.1",
     "@types/vscode": "^1.104.0",
+    "@types/yargs": "^17.0.33",
     "@typescript-eslint/eslint-plugin": "^8.56.0",
     "@typescript-eslint/parser": "^8.56.0",
-    "@vscode/test-cli": "^0.0.12",
-    "@vscode/test-electron": "^2.5.2",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.9.2",
     "esbuild": "^0.28.0",
     "eslint": "^10.0.1",
-    "typescript": "^5.9.3"
+    "semver": "^7.7.4",
+    "tsx": "^4.22.4",
+    "typescript": "^5.9.3",
+    "yargs": "^18.0.0"
   },
   "overrides": {
     "minimatch": "^10.2.1",

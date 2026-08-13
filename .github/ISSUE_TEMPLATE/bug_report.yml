@@ -1,0 +1,23 @@
+name: Bug Report
+description: File a bug/issue
+title: "<title>"
+type: "Bug"
+projects:
+  - Open-CMSIS-Pack/24
+
+body:
+  - type: textarea
+    id: description
+    attributes:
+      label: "Current behavior, Steps to reproduce and Expected behavior"
+      description: "Provide details about the bug."
+      placeholder: "Explain the unexpected behavior, steps to reproduce and expected behavior..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional_info
+    attributes:
+      label: "Additional Information"
+      description: "Any extra context or screenshots?"
+      placeholder: "Paste logs, screenshots, or links here."
