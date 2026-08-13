@@ -2,9 +2,9 @@
 
 This fork of [microsoft/DebugMCP](https://github.com/microsoft/DebugMCP) adapts the MCP debugger server for **Arm Cortex-M targets driven through the CMSIS Debugger VS Code extension**. Upstream DebugMCP is language-agnostic; it assumes a `vscode.debug.startDebugging(...)` call against a standard `launch.json` of type `python`, `node`, `cppdbg`, etc. It has no concept of a GDB target server, no memory or register reads, no fault decoding, no SVD awareness, no per-call timeouts, and no resilience to a wedged probe. Everything in this document exists because that is the gap to close before an AI agent can debug real embedded hardware (pyOCD / J-Link / CMSIS-DAP + `gdbtarget`).
 
-Upstream commit this fork is based on: [`4422d8c` — "upgrade version"](https://github.com/microsoft/DebugMCP/commit/4422d8c).
+Upstream baseline: forked at [`4422d8c`](https://github.com/microsoft/DebugMCP/commit/4422d8c) (2026-03-14), last synced against [`4051049`](https://github.com/microsoft/DebugMCP/commit/4051049) (upstream v2.3.0, 2026-08-05) in fork v2.0.0. See [§9](#9-upstream-work-deliberately-not-taken) for what was deliberately left behind.
 
-Current fork release: **v1.2.1** (2026-07-11) — see [CHANGELOG.md](CHANGELOG.md) for the per-version detail.
+Current fork release: **v2.0.3** (2026-08-10) — see [CHANGELOG.md](CHANGELOG.md) for the per-version detail.
 
 ---
 
@@ -48,9 +48,12 @@ All paths are relative to the extension root (`DebugMCP/`).
 | [`src/core/svdParser.ts`](src/core/svdParser.ts) | Minimal SVD XML parser. Resolves `derivedFrom`, computes field ranges, exposes `listPeripheralNames()` / `findPeripheral()` / `findRegister()` / `decodeFields()`. |
 | [`src/core/serialController.ts`](src/core/serialController.ts) | OWNED serial backend. `SerialPort` (from the `serialport` package) wrapped in a singleton with a 1 MB RX ring. Powers `serial_open` / `serial_close` / `serial_read` / `serial_write` / `serial_list_ports`. |
 | [`src/core/serialMonitorBridge.ts`](src/core/serialMonitorBridge.ts) | MS Serial Monitor BRIDGE. Probes `vscode.extensions.getExtension('ms-vscode.vscode-serial-monitor').exports` for any of `onDidReceiveData` / `onDataReceived` / `onData` / `onSerialData` / `onDidReadData` / `subscribeData`. Today the public API (v0.1.7) only exposes port enumeration; bridge falls back with a clear "data event not available" message and **auto-lights-up** when MS ships a data event. |
+| [`src/core/resetAssist.ts`](src/core/resetAssist.ts) | Pure reset-command mapping: pyOCD OpenOCD-style vs J-Link numeric `monitor reset` dialects, server-kind detection, unsupported-reply classification. No vscode imports — unit-testable. |
+| [`src/core/dwt.ts`](src/core/dwt.ts) | DWT register map (DEMCR/DWT_CTRL/DWT_CYCCNT + TRCENA/CYCCNTENA/NOCYCCNT bits) for `read_cycle_counter`. |
+| [`src/core/flashController.ts`](src/core/flashController.ts) | `pyocd load --cbuild-run` process control + output parsing (bytes programmed, rate, error lines, tail). Node builtins only — testable outside the extension host. |
 | [`src/serialHandler.ts`](src/serialHandler.ts) | Routes the `serial_*` MCP tools to either the OWNED controller or the BRIDGE depending on `from` argument. |
+| [`src/utils/sessionStateTracker.ts`](src/utils/sessionStateTracker.ts) | `DebugAdapterTrackerFactory` that records DAP `stopped` / `continued` events per session, exposed via `isSessionStopped(session)` and `getStoppedReason(session)`. The authoritative "is the target paused?" signal. Also: `waitForStopEvent(session, timeoutMs)` (awaitable stop events with reason + threadId) and a bounded per-session ring of recent adapter traffic (`getRecentDiagnostics()`) for launch-failure reporting. |
 | [`src/utils/timeout.ts`](src/utils/timeout.ts) | `withTimeout(operation, timeoutMs, task)` + `customRequestWithTimeout(session, command, args, timeoutMs)`. `HardwareTimeoutError` class with actionable message. |
-| [`src/utils/sessionStateTracker.ts`](src/utils/sessionStateTracker.ts) | `DebugAdapterTrackerFactory` that records DAP `stopped` / `continued` events per session, exposed via `isSessionStopped(session)` and `getStoppedReason(session)`. The authoritative "is the target paused?" signal. |
 | [`docs/agent-resources/cmsis-embedded-guide.md`](docs/agent-resources/cmsis-embedded-guide.md) | Agent-facing guide on Cortex-M fault-decode recipes, SCS memory map, common register layouts, RTOS tips. Exposed as MCP resource `cmsis-debugmcp://docs/cmsis-embedded-guide`. |
 | [`docs/agent-resources/troubleshooting/embedded.md`](docs/agent-resources/troubleshooting/embedded.md) | Embedded troubleshooting checklist (probe not detected, target not halted, SVD missing, wrong core selected on multi-core parts). Exposed as MCP resource. |
 | [`test/realboard/run.ts`](test/realboard/run.ts) | Real-board end-to-end test driver. Connects to the running MCP server (Streamable HTTP), exercises every tool, enforces `estimatedMs` pre-flight + 60 s hard cap, pauses and runs a diagnostic sweep on every overshoot. Reports PASS/FAIL/SKIP with per-call duration. |
@@ -63,9 +66,9 @@ All paths are relative to the extension root (`DebugMCP/`).
 |---|---|
 | [`src/debugMCPServer.ts`](src/debugMCPServer.ts) | Registers **all** new tools (`cmsis_action`, `pause_execution`, `get_call_stack`, `get_threads`, `get_frame_variables`, `serial_*`, `get_session_status`, `check_target_connection` + the original 5 embedded tools). Per-request `McpServer` + transport pair (was: shared instance with `close`/`reconnect` race). `setupTools(mcpServer)` and `setupResources(mcpServer)` take the per-request server as a parameter. `serialController.close()` + `serialMonitorBridge.unsubscribe()` on shutdown. |
 | [`src/debuggingHandler.ts`](src/debuggingHandler.ts) | Handlers for every new tool. `ensureStoppedSession(operation)` gates all inspection tools and surfaces state-aware errors. `handleStartDebugging` and `handleCmsisCommand` pre-check for an active session and refuse duplicates. `withHandlerTimeout` wraps every hardware-touching handler so it returns within the requested cap. `attemptRecoveryAfterTimeout` powers the 🩹 auto-heal on motion timeout. |
-| [`src/debuggingExecutor.ts`](src/debuggingExecutor.ts) | `startDebuggingByName()` for `gdbtarget`. New DAP-backed methods: `pause`, `getThreads`, `getCallStack`, `getVariablesForFrame`, plus the original `readMemory` / `readCoreRegisters` / `readPeripheralRegister` / `getFaultInfo` / `getDeviceInfo`. Per-method `timeoutMs` parameter capped to 60 s. Stepping via DAP `next` / `stepIn` / `stepOut` with UI fallback. `getSessionStatus()` 5-state classifier. `checkTargetConnection()` for the lightweight liveness probe. |
+| [`src/debuggingExecutor.ts`](src/debuggingExecutor.ts) | `startDebuggingByName()` for `gdbtarget`. New DAP-backed methods: `pause`, `getThreads`, `getCallStack`, `getVariablesForFrame`, `waitForStop`, `writeMemoryWord` (DAP `writeMemory` + read-back verify), `resetTarget` (monitor-command reset with PC-vs-reset-vector verification), `readCycleCounter`, plus the original `readMemory` / `readCoreRegisters` / `readPeripheralRegister` / `getFaultInfo` / `getDeviceInfo`. Per-method `timeoutMs` parameter capped to 60 s. Stepping via DAP `next` / `stepIn` / `stepOut` with UI fallback. `getSessionStatus()` 5-state classifier. `checkTargetConnection()` for the lightweight liveness probe. |
 | [`src/debugState.ts`](src/debugState.ts) | `StackFrame.frameId` added so `get_call_stack` can pass `frameId` back to `get_frame_variables`. |
-| [`src/extension.ts`](src/extension.ts) | Registers the `sessionStateTracker`. Calls `vscode.lm.registerMcpServerDefinitionProvider` for Copilot dynamic discovery. Renamed config section `debugmcp` → `cmsis-debugmcp`. New config keys `dapRequestTimeoutMs` and `memoryReadTimeoutMs`. Default timeout changed 180 → 60 s. |
+| [`src/extension.ts`](src/extension.ts) | Registers the `sessionStateTracker`. Calls `vscode.lm.registerMcpServerDefinitionProvider` for Copilot dynamic discovery. Renamed config section `debugmcp` → `cmsis-debugmcp`. New config keys `dapRequestTimeoutMs` and `memoryReadTimeoutMs`. Default timeout changed 180 → 60 s. Clears the parsed-SVD cache on debug-session termination. |
 | [`src/utils/agentConfigurationManager.ts`](src/utils/agentConfigurationManager.ts) | Dropped the static Copilot `mcp.json` write (superseded by `McpServerDefinitionProvider`). `updatePort()` so the actual OS-assigned port is reflected in Cline/Cursor configs. |
 | [`docs/agent-resources/debug_instructions.md`](docs/agent-resources/debug_instructions.md) | PHASE 0 (target awareness from CMSIS YAMLs + launch.json), PHASE 1 (5-state session-status gate decision table), Cortex-M hardware breakpoint limit guidance. CMSIS-first workflow steers agents to `cmsis_action load_and_debug` over `start_debugging`. |
 | [`package.json`](package.json) | `name`, `displayName`, `publisher`, `author`, `homepage`, `bugs`, `repository`, command ids, config section. Added `serialport` dependency. Keywords added: `embedded`, `cortex-m`, `cmsis`, `arm`, `gdbtarget`. |
@@ -97,15 +100,19 @@ All paths are relative to the extension root (`DebugMCP/`).
 
 **CMSIS Solution panel control:**
 - `cmsis_action(action, timeoutMs?)` — `build` / `load` / `erase` / `load_and_run` / `load_and_debug` / `attach` / `detach` / `stop_run`. ⭐ Preferred entry point for embedded.
+- `flash(cbuildRunFile?, timeoutMs?)` — `pyocd load --cbuild-run` as a synchronous operation: bytes programmed + structured flash error; refuses under an active session.
 
 **Session lifecycle & state:**
 - `pause_execution(timeoutMs?)` — DAP pause, state-aware
+- `wait_for_stop(timeoutMs?)` — block on the raw DAP `stopped` event; returns stop reason + state, or a structured timeout
+- `reset(method?, halt?, timeoutMs?)` — in-session target reset via GDB monitor commands, verified PC-vs-reset-vector; honest "did NOT reset" reporting
 - `get_session_status()` — 5-state classifier (`no-session` / `initializing` / `running` / `stopped` / `unresponsive`), never throws
 - `check_target_connection()` — fast DAP `threads` liveness probe
 
 **Inspection:**
 - `read_memory(address, length, format, timeoutMs?)` — DAP `readMemory` with GDB fallback
 - `read_core_registers(timeoutMs?)` — R0–R15, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK
+- `read_cycle_counter(timeoutMs?)` — DWT CYCCNT with trace/counter enable, NOCYCCNT detection, wrap/halt/WFE caveats
 - `read_peripheral_register(peripheral, register?, timeoutMs?)` — SVD-backed, names like `GPIOA`/`ODR`
 - `get_fault_info(timeoutMs?)` — decoded CFSR/HFSR/DFSR/MMFAR/BFAR/AFSR
 - `get_device_info()` — probe, device, GDB server, port, CMSIS config
@@ -127,7 +134,7 @@ All paths are relative to the extension root (`DebugMCP/`).
 
 ### Existing tools modified
 
-- `start_debugging` — `fileFullPath` is now optional; `configurationName` is the primary entry point for `gdbtarget`; refuses duplicates; demoted to non-CMSIS use cases in tool description.
+- `start_debugging` — `fileFullPath` is now optional; `configurationName` is the primary entry point for `gdbtarget`; refuses duplicates; demoted to non-CMSIS use cases in tool description; failures append recent adapter traffic (failed DAP responses, adapter stderr/console) instead of one opaque line.
 - `step_over` / `step_into` / `step_out` / `continue_execution` — accept `timeoutMs`, auto-heal on overshoot by issuing DAP `pause` and reporting PC.
 - `get_variables_values` / `evaluate_expression` — accept `timeoutMs`, state-aware errors.
 - `restart_debugging` — actually waits for session readiness instead of fixed 300 ms.
@@ -164,3 +171,30 @@ Tool schemas that differ from names agents commonly guess — worth documenting 
 ## 8. Relationship to upstream
 
 This fork is **not** intended to be merged back as-is — the embedded surface (CMSIS pipeline, fault decoder, SVD reader, hardware-timeout layer, dual serial backend) would be dead code for the 95% of upstream users debugging Python/TypeScript. The clean path for upstreaming would be factoring `src/core/*`, `src/utils/timeout.ts`, and `src/utils/sessionStateTracker.ts` into an optional "embedded" feature module gated on the presence of the CMSIS Debugger extension, and making the timeout layer + state-aware errors available generically while keeping the SVD / fault decoder / CMSIS panel controls gated. That refactor is out of scope for this evaluation build.
+
+---
+
+## 9. Upstream work deliberately not taken
+
+Synced against upstream v2.3.0. These are the changes that were considered and rejected, with the reason — so the next sync does not re-litigate them.
+
+| Upstream change | Why not |
+|---|---|
+| **`get_variables_values` requires `variableNames`** (2.3.0, breaking) | Taken as an *optional* filter instead, alongside the new `list_variable_names`. Embedded frames are small, so the full dump is usually what you want; making it mandatory would break every existing agent prompt for no gain here. |
+| **`src/utils/withTimeout.ts`** | The fork's `src/utils/timeout.ts` is a strict superset — it also carries `customRequestWithTimeout` and `HardwareTimeoutError`. Porting it would mean two timeout utilities. |
+| **`debugTestAtCursor` / VS Code Testing API test debugging** | No meaning for `gdbtarget` firmware. There is no test runner on the target. |
+| **`debugConfigurationManager` refactor** (`-396` lines) | Upstream's went toward .NET/csproj auto-configuration. The fork's version is CMSIS-specific and keeps `jsonc-parser` (which upstream dropped) because CMSIS Solution generates `launch.json` *with comments*. |
+| **Removal of `get_debug_instructions` and its doc** | Kept. Upstream replaced them with the `debug-live` Agent Skill, but GitHub Copilot Chat reads MCP tools and not `~/.agents/skills` — removing the tool would leave that harness with no guidance at all. The fork ships *both*: the tool and the `cmsis-debug-live` skill. |
+| **The `debug-live` skill name** | The fork's skill is `cmsis-debug-live`. Both extensions can be installed at once and would otherwise fight over the same directory, leaving whichever registered last in place with a workflow written for the wrong kind of target. For the same reason the fork does no legacy-name cleanup — removing a `debug-live` directory would delete upstream's skill. |
+| **`6f7fa56` "Remove extra checks in hasActiveSession()"** | Not ported (since v1.1.9). The fork replaced that gate with a DAP-event tracker plus `ensureStoppedSession` and state-aware errors, which is the better fix for embedded targets. |
+
+### Taken, but adapted
+
+| Upstream change | How it differs here |
+|---|---|
+| **Multi-window routing** (PR #104) | Same router/registry/control-server shape, but upstream resolves targets from a file path alone — fine there, since every one of its tools takes one. Only four do here, so the ladder continues: explicit pin → session target → the sole window with an active debug session → the sole window. Ties error out naming every candidate instead of guessing. Adds `list_debug_windows` / `select_debug_window`. Dispatch uses one compile-time-checked op table rather than two hand-written switches, because 42 ops duplicated twice would drift. |
+| **Secret redaction** (PR #119) | Module ported nearly verbatim, policy adapted. Numeric scalars are never withheld whatever the variable is called — in firmware `auth`, `token` and `secret` are overwhelmingly `uint8_t` flags and parser tags, and a 32-bit integer cannot carry a credential. Raw target reads bypass redaction entirely, because real SVDs name registers `KEY`, `KR`, `KEYR` and `UNLOCK`. |
+| **Logpoints** (issue #15) | Bound GDB-native via `dprintf`, with explicit printf specifiers (`{expr}` → `%d`, `{expr:%s}` to override) since GDB infers nothing about types. A condition is attached afterwards by breakpoint number, because `dprintf` takes no inline `if`. The tool description states plainly that the core still halts per hit — logpoints are not free on a Cortex-M. |
+| **`add_breakpoint` by line** (issue #18) | Taken, but `lineContent` is retained as a deprecated fallback so existing agent prompts keep working. |
+| **Stateful session transport** (PR #96) | Taken. Note this replaced the fork's *per-request* model, which existed to fix a concurrency bug — the regression is guarded by `test/transport/session-lifecycle.js`. |
+| **esbuild bundling** | Script prepared, **packaging not switched over** — see [docs/packaging-esbuild.md](docs/packaging-esbuild.md). `serialport` must stay external regardless: `node-gyp-build` resolves its native `.node` relative to `__dirname` at runtime. |

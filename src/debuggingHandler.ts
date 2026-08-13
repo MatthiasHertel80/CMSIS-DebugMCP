@@ -1,10 +1,22 @@
 // Copyright (c) Microsoft Corporation.
 
 import * as vscode from 'vscode';
+import * as path from 'path';
+import * as jsonc from 'jsonc-parser';
 import { IDebugConfigurationManager } from './utils/debugConfigurationManager';
-import { DebugState } from './debugState';
+import { DebugState, formatBreakpointModifiers } from './debugState';
 import { IDebuggingExecutor } from './debuggingExecutor';
 import { HardwareTimeoutError, withTimeout } from './utils/timeout';
+import { fileExists, flashWithPyocd, probePyocd } from './core/flashController';
+import { redactExpressionResult, redactVariableValue, REDACTION_NOTICE } from './utils/secretRedaction';
+import {
+    DapScope,
+    formatMissingNames,
+    renderScopes,
+    renderVariableNames,
+    selectVariables,
+} from './core/variableView';
+import { getRecentDiagnostics } from './utils/sessionStateTracker';
 import { logger } from './utils/logger';
 
 const HARD_HANDLER_CAP_MS = 60_000;
@@ -58,15 +70,20 @@ export interface IDebuggingHandler {
     handleStepOut(args?: { timeoutMs?: number }): Promise<string>;
     handleContinue(args?: { timeoutMs?: number }): Promise<string>;
     handlePause(args?: { timeoutMs?: number }): Promise<string>;
+    handleWaitForStop(args?: { timeoutMs?: number }): Promise<string>;
     handleRestart(args?: { timeoutMs?: number }): Promise<string>;
-    handleAddBreakpoint(args: { fileFullPath: string; lineContent: string }): Promise<string>;
+    handleReset(args: { method?: 'auto' | 'system' | 'core' | 'hardware'; halt?: boolean; timeoutMs?: number }): Promise<string>;
+    handleAddBreakpoint(args: { fileFullPath: string; line?: number; condition?: string; lineContent?: string }): Promise<string>;
+    handleAddLogpoint(args: { fileFullPath: string; line: number; logMessage: string; condition?: string }): Promise<string>;
     handleRemoveBreakpoint(args: { fileFullPath: string; line: number }): Promise<string>;
     handleClearAllBreakpoints(): Promise<string>;
     handleListBreakpoints(): Promise<string>;
-    handleGetVariables(args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string>;
+    handleListVariableNames(args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string>;
+    handleGetVariables(args: { scope?: 'local' | 'global' | 'all'; variableNames?: string[]; timeoutMs?: number }): Promise<string>;
     handleEvaluateExpression(args: { expression: string; timeoutMs?: number }): Promise<string>;
     handleReadMemory(args: { address: string; length: number; format?: 'hex' | 'ascii' | 'both'; timeoutMs?: number }): Promise<string>;
     handleReadCoreRegisters(args?: { timeoutMs?: number }): Promise<string>;
+    handleReadCycleCounter(args?: { timeoutMs?: number }): Promise<string>;
     handleReadPeripheralRegister(args: { peripheral: string; register?: string; timeoutMs?: number }): Promise<string>;
     handleGetFaultInfo(args?: { timeoutMs?: number }): Promise<string>;
     handleGetDeviceInfo(): Promise<string>;
@@ -74,8 +91,9 @@ export interface IDebuggingHandler {
     handleGetSessionStatus(): Promise<string>;
     handleGetCallStack(args: { threadId?: number; levels?: number; timeoutMs?: number }): Promise<string>;
     handleGetThreads(args?: { timeoutMs?: number }): Promise<string>;
-    handleGetFrameVariables(args: { frameId: number; scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string>;
+    handleGetFrameVariables(args: { frameId: number; scope?: 'local' | 'global' | 'all'; variableNames?: string[]; timeoutMs?: number }): Promise<string>;
     handleCmsisCommand(args: { action: CmsisAction; timeoutMs?: number }): Promise<string>;
+    handleFlash(args: { cbuildRunFile?: string; timeoutMs?: number }): Promise<string>;
 }
 
 export type CmsisAction =
@@ -102,6 +120,39 @@ export class DebuggingHandler implements IDebuggingHandler {
         timeoutInSeconds: number
     ) {
         this.timeoutInSeconds = timeoutInSeconds;
+    }
+
+    /**
+     * The redaction callback to hand to the variable renderer, or undefined
+     * when redaction is off.
+     *
+     * Read per call rather than cached at construction so toggling the setting
+     * takes effect without a window reload. Only the *symbolic* paths are
+     * gated: read_memory, read_core_registers, read_peripheral_register and
+     * get_fault_info deliberately never pass through here. Those return raw
+     * target state, and several SVDs name real registers KEY, KR or UNLOCK
+     * (watchdog and flash-controller unlock registers) — withholding them
+     * would break exactly the debugging they exist for, and a memory-mapped
+     * register is not a credential.
+     */
+    private redactor(): ((name: string, value: string) => { value: string; redacted: boolean }) | undefined {
+        const enabled = vscode.workspace
+            .getConfiguration('cmsis-debugmcp')
+            .get<boolean>('redactSecrets', true);
+        if (!enabled) { return undefined; }
+        return (name, value) => redactVariableValue(name, value);
+    }
+
+    /**
+     * Recent adapter-originated traffic (failed DAP responses, adapter
+     * stderr/console output) as an error-message suffix, or '' when the
+     * buffer is empty. Launch failures otherwise surface only as one nested
+     * message line while the real cause sits in the extension-host log.
+     */
+    private diagnosticsSuffix(): string {
+        const diag = getRecentDiagnostics();
+        if (diag.length === 0) { return ''; }
+        return `\nRecent adapter traffic (last ${diag.length} lines):\n  ${diag.join('\n  ')}`;
     }
 
     /**
@@ -177,7 +228,7 @@ export class DebuggingHandler implements IDebuggingHandler {
                 throw new Error('Failed to start debug session. Make sure the appropriate language extension is installed.');
             }
         } catch (error) {
-            throw new Error(`Error starting debug session: ${error}`);
+            throw new Error(`Error starting debug session: ${error}${this.diagnosticsSuffix()}`);
         }
     }
 
@@ -382,6 +433,46 @@ export class DebuggingHandler implements IDebuggingHandler {
     }
 
     /**
+     * Block until the target next stops (breakpoint, fault, step-complete,
+     * pause) and return the stop reason plus the current debug state, or a
+     * structured timeout. Use after continue_execution returned while the
+     * target was still running, after issuing execution through
+     * evaluate_expression ("-exec continue"), or to catch the first
+     * breakpoint of a free-running session — this replaces blind sleeping.
+     * Issues no execution commands itself.
+     */
+    public async handleWaitForStop(args?: { timeoutMs?: number }): Promise<string> {
+        return withHandlerTimeout('wait_for_stop', args?.timeoutMs, async () => {
+            if (!this.executor.hasDebugSession()) {
+                throw new Error('No active debug session. Start debugging first — wait_for_stop waits on a live session.');
+            }
+            // Leave a margin under the handler fence so the structured
+            // timeout text wins over the generic fence message when both
+            // would fire at the same deadline.
+            const budget = args?.timeoutMs ? Math.max(args.timeoutMs - 1_500, 100) : 28_500;
+            const result = await this.executor.waitForStop(budget);
+            if (result.kind === 'timeout') {
+                return 'Target did not stop within the timeout — it is still running (or the probe is unresponsive). ' +
+                    'Options: call wait_for_stop again with a larger timeoutMs, pause_execution to see where it is, ' +
+                    'or check_target_connection if other calls are also stalling.';
+            }
+            if (result.kind === 'ended') {
+                return 'The debug session ended while waiting for a stop — the target may have crashed, the probe ' +
+                    'disconnected, or the session was stopped in the UI. Call get_session_status to confirm.';
+            }
+            // Let VS Code surface the new frame before snapshotting (same
+            // settle delay waitForTargetStopped uses).
+            await new Promise(resolve => setTimeout(resolve, this.executionDelay));
+            const state = await this.executor.getCurrentDebugState(this.numNextLines);
+            const threadInfo = result.kind === 'stopped' && result.threadId !== null ? `, threadId=${result.threadId}` : '';
+            const head = result.kind === 'already-stopped'
+                ? `Target was already stopped (reason: ${result.reason ?? 'unknown'}).`
+                : `Target stopped (reason: ${result.reason ?? 'unknown'}${threadInfo}).`;
+            return `${head}\n\n${state.toString()}`;
+        });
+    }
+
+    /**
      * Restart the debugging session
      */
     public async handleRestart(_args?: { timeoutMs?: number }): Promise<string> {
@@ -412,6 +503,41 @@ export class DebuggingHandler implements IDebuggingHandler {
     }
 
     /**
+     * Reset the target inside the live session and verify the reset took
+     * effect (PC compared against the reset vector). Unlike restart_debugging
+     * the debug session and its breakpoints survive. Reports honestly when
+     * the target did not appear to reset — silent non-resets are common on
+     * attach configurations.
+     */
+    public async handleReset(args: { method?: 'auto' | 'system' | 'core' | 'hardware'; halt?: boolean; timeoutMs?: number }): Promise<string> {
+        return withHandlerTimeout('reset', args?.timeoutMs, async () => {
+            if (!this.executor.hasDebugSession()) {
+                throw new Error('No active debug session. Start debugging first — reset drives the target through the live probe.');
+            }
+            const outcome = await this.executor.resetTarget({
+                method: args?.method ?? 'auto',
+                halt: args?.halt,
+                timeoutMs: args?.timeoutMs,
+            });
+            const commandsLine = outcome.commandsIssued.length > 0
+                ? ` Commands: ${outcome.commandsIssued.map(c => `'${c}'`).join(', ')} (server: ${outcome.serverKind}).`
+                : '';
+            if (outcome.verified) {
+                const next = args?.halt === false
+                    ? ' Target resumed (halt=false).'
+                    : ' Target is halted at the reset vector — use continue_execution to run.';
+                return `Target reset verified. ${outcome.verificationDetail}. ` +
+                    `Method(s) tried: ${outcome.methodsTried.join(', ')}.${commandsLine}${next}`;
+            }
+            return `⚠️ Reset was issued but the target does NOT appear to have reset. ${outcome.verificationDetail}. ` +
+                `Method(s) tried: ${outcome.methodsTried.join(', ')}.${commandsLine} ` +
+                `'hardware' requires nSRST wired from probe to target — if it is not connected, no software reset can ` +
+                `recover this; power-cycle the board or reconnect the probe. ` +
+                `Adapter replies: ${outcome.replies.join(' | ') || '<none>'}`;
+        });
+    }
+
+    /**
      * Add a breakpoint at specified location
      */
     /**
@@ -435,45 +561,233 @@ export class DebuggingHandler implements IDebuggingHandler {
         return 'unconfirmed';
     }
 
-    public async handleAddBreakpoint(args: { fileFullPath: string; lineContent: string }): Promise<string> {
-        const { fileFullPath, lineContent } = args;
+    /**
+     * Resolve the target line(s) for a breakpoint request.
+     *
+     * `line` is the supported form. `lineContent` is the deprecated original
+     * form kept so existing agent prompts keep working: it substring-matches
+     * every line in the file, which in C routinely matches dozens of lines
+     * (`}`, `return;`, `break;`) and silently sets a breakpoint on all of them.
+     */
+    private static async resolveBreakpointLines(
+        fileFullPath: string,
+        line?: number,
+        lineContent?: string,
+    ): Promise<{ lines: number[]; usedFallback: boolean }> {
+        if (typeof line === 'number') {
+            if (!Number.isInteger(line) || line < 1) {
+                throw new Error(`Invalid line number ${line}: must be a 1-based integer.`);
+            }
+            return { lines: [line], usedFallback: false };
+        }
+
+        if (!lineContent) {
+            throw new Error(
+                'No location given: pass `line` (1-based line number). ' +
+                'The legacy `lineContent` form is still accepted but deprecated.',
+            );
+        }
+
+        const document = await vscode.workspace.openTextDocument(vscode.Uri.file(fileFullPath));
+        const lines = document.getText().split(/\r?\n/);
+        const matching: number[] = [];
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].includes(lineContent)) {
+                matching.push(i + 1); // 1-based
+            }
+        }
+        if (matching.length === 0) {
+            throw new Error(`Could not find any lines containing: ${lineContent}`);
+        }
+        return { lines: matching, usedFallback: true };
+    }
+
+    /**
+     * Translate a VS Code logpoint message into a GDB `dprintf` format string
+     * plus its argument list.
+     *
+     * VS Code interpolates `{expr}` and infers the rendering from the runtime
+     * type. GDB's `printf` has no such inference — it needs an explicit
+     * conversion specifier per argument, and picking the wrong one prints
+     * garbage rather than erroring. So:
+     *
+     *   - `{expr}`      → `%d`   (the overwhelmingly common embedded case)
+     *   - `{expr:%s}`   → `%s`   (explicit specifier wins; use for strings,
+     *                             `%f` for floats, `%p` for pointers, ...)
+     *   - `{{` / `}}`   → literal `{` / `}`
+     *
+     * A literal `%` in the message is escaped to `%%` so it survives printf.
+     */
+    public static translateLogMessage(logMessage: string): { format: string; args: string[] } {
+        const SPECIFIER = /^(.*):(%[-+ #0-9.]*(?:hh|h|ll|l|z|j|t|L)?[diouxXeEfgGaAcsp])$/;
+        const args: string[] = [];
+        let format = '';
+
+        for (let i = 0; i < logMessage.length; i++) {
+            const ch = logMessage[i];
+
+            if ((ch === '{' || ch === '}') && logMessage[i + 1] === ch) {
+                format += ch; // doubled brace → literal brace
+                i++;
+                continue;
+            }
+
+            if (ch === '{') {
+                const close = logMessage.indexOf('}', i + 1);
+                if (close === -1) {
+                    throw new Error(
+                        `Unbalanced '{' in logMessage at position ${i}. ` +
+                        'Use {{ for a literal brace.',
+                    );
+                }
+                const inner = logMessage.slice(i + 1, close).trim();
+                if (!inner) {
+                    throw new Error(`Empty interpolation '{}' in logMessage at position ${i}.`);
+                }
+                const withSpec = SPECIFIER.exec(inner);
+                if (withSpec) {
+                    format += withSpec[2];
+                    args.push(withSpec[1].trim());
+                } else {
+                    format += '%d';
+                    args.push(inner);
+                }
+                i = close;
+                continue;
+            }
+
+            if (ch === '}') {
+                throw new Error(
+                    `Unbalanced '}' in logMessage at position ${i}. Use }} for a literal brace.`,
+                );
+            }
+
+            // Escape for both the GDB command string and printf itself.
+            if (ch === '%') { format += '%%'; }
+            else if (ch === '"') { format += '\\"'; }
+            else if (ch === '\\') { format += '\\\\'; }
+            else if (ch === '\n') { format += '\\n'; }
+            else { format += ch; }
+        }
+
+        return { format: `${format}\\n`, args };
+    }
+
+    /** Pull the breakpoint number out of a GDB `Dprintf N at 0x...` echo. */
+    private static parseGdbBreakpointNumber(raw: string): number | null {
+        const m = /(?:Dprintf|Breakpoint)\s+(\d+)\s+at/i.exec(raw ?? '');
+        return m ? Number(m[1]) : null;
+    }
+
+    public async handleAddLogpoint(args: {
+        fileFullPath: string;
+        line: number;
+        logMessage: string;
+        condition?: string;
+    }): Promise<string> {
+        const { fileFullPath, line, logMessage, condition } = args;
 
         try {
-            // Find the line number(s) containing the line content
-            const document = await vscode.workspace.openTextDocument(vscode.Uri.file(fileFullPath));
-            const text = document.getText();
-            const lines = text.split(/\r?\n/);
-            const matchingLineNumbers: number[] = [];
+            if (!Number.isInteger(line) || line < 1) {
+                throw new Error(`Invalid line number ${line}: must be a 1-based integer.`);
+            }
 
-            for (let i = 0; i < lines.length; i++) {
-                if (lines[i].includes(lineContent)) {
-                    matchingLineNumbers.push(i + 1); // Convert to 1-based line numbers
+            const { format, args: printfArgs } = DebuggingHandler.translateLogMessage(logMessage);
+            const uri = vscode.Uri.file(fileFullPath);
+
+            // 1) VS Code model, so the logpoint shows in the gutter and in
+            //    list_breakpoints like any other breakpoint.
+            await this.executor.addBreakpoint(uri, line, { condition, logMessage });
+
+            if (!this.executor.hasDebugSession()) {
+                return `Logpoint added at ${fileFullPath}:${line}\n` +
+                    `(No debug session yet — added to the breakpoint list. Re-add after the session is up ` +
+                    `so it is bound GDB-native via \`dprintf\`.)`;
+            }
+
+            // 2) GDB-native `dprintf` — the path that actually fires on gdbtarget.
+            const reply = await this.executor.setLogpointViaGdb(fileFullPath, line, format, printfArgs);
+            const cls = DebuggingHandler.classifyGdbBreakpointReply(reply);
+
+            const lines: string[] = [];
+            lines.push(`Logpoint added at ${fileFullPath}:${line}`);
+            lines.push(`  GDB: dprintf ${fileFullPath}:${line},"${format}"${printfArgs.length ? ',' + printfArgs.join(',') : ''}`);
+
+            if (cls === 'rejected') {
+                lines.push(`⚠️ GDB rejected the logpoint: ${reply}`);
+                lines.push(
+                    'Check that the path matches the ELF\'s compiled paths, and that every interpolated ' +
+                    'expression is in scope at that line.',
+                );
+                return lines.join('\n');
+            }
+
+            if (condition) {
+                // `dprintf` takes no inline `if` clause — the condition has to be
+                // attached by breakpoint number afterwards.
+                const bpNum = DebuggingHandler.parseGdbBreakpointNumber(reply);
+                if (bpNum !== null) {
+                    const condReply = await this.executor.setBreakpointConditionViaGdb(bpNum, condition);
+                    lines.push(`  Condition applied to GDB breakpoint ${bpNum}: ${condition}` +
+                        (condReply ? ` — ${condReply}` : ''));
+                } else {
+                    lines.push(
+                        `⚠️ Condition "${condition}" was set on the VS Code breakpoint but NOT on the GDB ` +
+                        `dprintf: the adapter did not echo a breakpoint number to attach it to. The logpoint ` +
+                        `will fire unconditionally. Apply it manually with ` +
+                        `evaluate_expression("-exec condition <n> ${condition}") after finding <n> via ` +
+                        `evaluate_expression("-exec info breakpoints").`,
+                    );
                 }
             }
 
-            if (matchingLineNumbers.length === 0) {
-                throw new Error(`Could not find any lines containing: ${lineContent}`);
-            }
+            lines.push(
+                '\nℹ️ On Cortex-M a logpoint is not free: the core halts on every hit while GDB formats and ' +
+                'prints, then resumes. In a hot loop or an ISR this distorts timing far more than it would in ' +
+                'a host process. For high-rate tracing prefer read_cycle_counter around the region, or have ' +
+                'the firmware fill a RAM buffer you read with read_memory.',
+            );
+            return lines.join('\n');
+        } catch (error) {
+            throw new Error(`Error adding logpoint: ${error}`);
+        }
+    }
+
+    public async handleAddBreakpoint(args: {
+        fileFullPath: string;
+        line?: number;
+        condition?: string;
+        lineContent?: string;
+    }): Promise<string> {
+        const { fileFullPath, line, condition, lineContent } = args;
+
+        try {
+            const { lines: targetLines, usedFallback } =
+                await DebuggingHandler.resolveBreakpointLines(fileFullPath, line, lineContent);
 
             const uri = vscode.Uri.file(fileFullPath);
 
             // 1) Add to VS Code's breakpoint model — keeps list_breakpoints and
             //    the editor gutter in sync.
-            for (const lineNumber of matchingLineNumbers) {
-                await this.executor.addBreakpoint(uri, lineNumber);
+            for (const lineNumber of targetLines) {
+                await this.executor.addBreakpoint(uri, lineNumber, { condition });
             }
 
             // 2) Bind GDB-native via `-exec break`. On gdbtarget sessions the
             //    VS Code model's setBreakpoints request is not reliably
             //    forwarded to the adapter, so the model add alone leaves the
             //    target running straight through. The GDB break makes it bind
-            //    for real — this is what actually stops the CPU.
+            //    for real — this is what actually stops the CPU. The condition
+            //    rides along as GDB's native `if` clause so the core is not
+            //    halted on every hit.
             const gdbReplies: string[] = [];
             let anyRejected = false;
             let anyConfirmed = false;
             if (this.executor.hasDebugSession()) {
-                for (const lineNumber of matchingLineNumbers) {
-                    const reply = await this.executor.setBreakpointViaGdb(fileFullPath, lineNumber);
+                for (const lineNumber of targetLines) {
+                    const reply = await this.executor.setBreakpointViaGdb(
+                        fileFullPath, lineNumber, undefined, condition,
+                    );
                     const cls = DebuggingHandler.classifyGdbBreakpointReply(reply);
                     if (cls === 'rejected') { anyRejected = true; }
                     if (cls === 'bound') { anyConfirmed = true; }
@@ -486,10 +800,16 @@ export class DebuggingHandler implements IDebuggingHandler {
                 }
             }
 
-            const locList = matchingLineNumbers.join(', ');
-            const head = matchingLineNumbers.length === 1
-                ? `Breakpoint added at ${fileFullPath}:${matchingLineNumbers[0]}`
-                : `Breakpoints added at ${matchingLineNumbers.length} locations in ${fileFullPath}: lines ${locList}`;
+            const condSuffix = condition ? ` [when: ${condition}]` : '';
+            const locList = targetLines.join(', ');
+            let head = targetLines.length === 1
+                ? `Breakpoint added at ${fileFullPath}:${targetLines[0]}${condSuffix}`
+                : `Breakpoints added at ${targetLines.length} locations in ${fileFullPath}: lines ${locList}${condSuffix}`;
+
+            if (usedFallback) {
+                head += `\n⚠️ Located via the deprecated \`lineContent\` match (${targetLines.length} line(s) matched). ` +
+                    `Pass \`line\` instead — content matching hits every line containing the text.`;
+            }
 
             if (!this.executor.hasDebugSession()) {
                 return `${head}\n(No debug session yet — added to the breakpoint list. ` +
@@ -568,9 +888,9 @@ export class DebuggingHandler implements IDebuggingHandler {
                 if (bp instanceof vscode.SourceBreakpoint) {
                     const fileName = bp.location.uri.fsPath.split(/[/\\]/).pop();
                     const line = bp.location.range.start.line + 1;
-                    breakpointList += `${index + 1}. ${fileName}:${line}\n`;
+                    breakpointList += `${index + 1}. ${fileName}:${line}${formatBreakpointModifiers(bp)}\n`;
                 } else if (bp instanceof vscode.FunctionBreakpoint) {
-                    breakpointList += `${index + 1}. Function: ${bp.functionName}\n`;
+                    breakpointList += `${index + 1}. Function: ${bp.functionName}${formatBreakpointModifiers(bp)}\n`;
                 }
             });
 
@@ -583,57 +903,77 @@ export class DebuggingHandler implements IDebuggingHandler {
     /**
      * Get variables from current debug context
      */
-    public async handleGetVariables(args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string> {
+    /**
+     * Read the scopes at the active frame, applying the 'global'-scope fallback
+     * that several adapters need. Shared by get_variables_values and
+     * list_variable_names so they can never disagree about what is in scope.
+     */
+    private async readActiveFrameScopes(
+        scope: 'local' | 'global' | 'all',
+        timeoutMs?: number,
+    ): Promise<{ scopes: DapScope[]; globalFallback: boolean }> {
+        const activeStackItem = vscode.debug.activeStackItem;
+        if (!activeStackItem || !('frameId' in activeStackItem)) {
+            throw new Error('No active stack frame. Make sure execution is paused at a breakpoint.');
+        }
+
+        let variablesData = await this.executor.getVariables(activeStackItem.frameId, scope, timeoutMs);
+
+        // If 'global' scope was requested but not available, fall back to all scopes.
+        let globalFallback = false;
+        if (scope === 'global' && (!variablesData.scopes || variablesData.scopes.length === 0)) {
+            variablesData = await this.executor.getVariables(activeStackItem.frameId, 'all', timeoutMs);
+            globalFallback = true;
+        }
+
+        return { scopes: (variablesData.scopes ?? []) as DapScope[], globalFallback };
+    }
+
+    public async handleListVariableNames(args: { scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string> {
         const { scope = 'all', timeoutMs } = args;
+
+        return withHandlerTimeout('list_variable_names', timeoutMs, async () => {
+            await this.ensureStoppedSession('list variable names');
+            const { scopes } = await this.readActiveFrameScopes(scope, timeoutMs);
+            if (scopes.length === 0) {
+                return 'No variable scopes available at current execution point.';
+            }
+            return renderVariableNames(scopes);
+        });
+    }
+
+    public async handleGetVariables(args: {
+        scope?: 'local' | 'global' | 'all';
+        variableNames?: string[];
+        timeoutMs?: number;
+    }): Promise<string> {
+        const { scope = 'all', variableNames, timeoutMs } = args;
 
         return withHandlerTimeout('get_variables_values', timeoutMs, async () => {
             await this.ensureStoppedSession('read variables');
 
-            const activeStackItem = vscode.debug.activeStackItem;
-            if (!activeStackItem || !('frameId' in activeStackItem)) {
-                throw new Error('No active stack frame. Make sure execution is paused at a breakpoint.');
-            }
-
-            let variablesData = await this.executor.getVariables(activeStackItem.frameId, scope, timeoutMs);
-
-            // If 'global' scope was requested but not available, fall back to returning all scopes
-            let globalFallback = false;
-            if (scope === 'global' && (!variablesData.scopes || variablesData.scopes.length === 0)) {
-                variablesData = await this.executor.getVariables(activeStackItem.frameId, 'all', timeoutMs);
-                globalFallback = true;
-            }
-
-            if (!variablesData.scopes || variablesData.scopes.length === 0) {
+            const { scopes, globalFallback } = await this.readActiveFrameScopes(scope, timeoutMs);
+            if (scopes.length === 0) {
                 return 'No variable scopes available at current execution point.';
             }
 
-            let variablesInfo = '';
+            const { scopes: selected, missing } = variableNames?.length
+                ? selectVariables(scopes, variableNames)
+                : { scopes, missing: [] as string[] };
+
+            let out = '';
             if (globalFallback) {
-                variablesInfo += 'Note: No dedicated "Global" scope is available from this debug adapter. Showing all available scopes instead. Use evaluate_expression to inspect specific global variables by name.\n\n';
-            }
-            variablesInfo += 'Variables:\n==========\n\n';
-
-            for (const scopeItem of variablesData.scopes) {
-                variablesInfo += `${scopeItem.name}:\n`;
-                
-                if (scopeItem.error) {
-                    variablesInfo += `  Error retrieving variables: ${scopeItem.error}\n`;
-                } else if (scopeItem.variables && scopeItem.variables.length > 0) {
-                    for (const variable of scopeItem.variables) {
-                        variablesInfo += `  ${variable.name}: ${variable.value}`;
-                        if (variable.type) {
-                            variablesInfo += ` (${variable.type})`;
-                        }
-                        variablesInfo += '\n';
-                    }
-                } else {
-                    variablesInfo += '  No variables in this scope\n';
-                }
-                
-                variablesInfo += '\n';
+                out += 'Note: No dedicated "Global" scope is available from this debug adapter. Showing all available scopes instead. Use evaluate_expression to inspect specific global variables by name.\n\n';
             }
 
-            return variablesInfo;
+            if (variableNames?.length && selected.length === 0) {
+                return out + `None of the requested variables are in scope: ${variableNames.join(', ')}.\n` +
+                    'Call list_variable_names to see what is available here.';
+            }
+
+            out += renderScopes(selected, { header: 'Variables', redact: this.redactor() });
+            out += formatMissingNames(missing);
+            return out;
         });
     }
 
@@ -654,10 +994,24 @@ export class DebuggingHandler implements IDebuggingHandler {
             const response = await this.executor.evaluateExpression(expression, activeStackItem.frameId, timeoutMs);
 
             if (response && response.result !== undefined) {
+                // evaluate_expression is the trivial bypass for per-variable
+                // redaction — `os.environ` or a bare `apiKey` returns the same
+                // value the variable view withheld. Raw GDB CLI passthrough is
+                // exempt: `-exec info registers` and friends return target
+                // state, not program values, and must come back verbatim.
+                const isGdbPassthrough = expression.trimStart().startsWith('-exec');
+                const redact = this.redactor();
+                const verdict = (redact && !isGdbPassthrough)
+                    ? redactExpressionResult(expression, response.result)
+                    : { value: String(response.result), redacted: false };
+
                 let resultText = `Expression: ${expression}\n`;
-                resultText += `Result: ${response.result}`;
+                resultText += `Result: ${verdict.value}`;
                 if (response.type) {
                     resultText += ` (${response.type})`;
+                }
+                if (verdict.redacted) {
+                    resultText += `\n\n${REDACTION_NOTICE}`;
                 }
 
                 return resultText;
@@ -746,8 +1100,10 @@ export class DebuggingHandler implements IDebuggingHandler {
                 stackDisposable.dispose();
                 sessionDisposable.dispose();
                 clearTimeout(timer);
-                // Small delay to let VS Code update the active editor/cursor
-                await new Promise(r => setTimeout(r, 300));
+                // No settle delay needed: getCurrentDebugState reads the location
+                // from the DAP top stack frame, which is already correct at this
+                // point. It used to scrape the editor cursor, which VS Code
+                // updates asynchronously — hence the old 300 ms sleep here.
                 const state = await this.executor.getCurrentDebugState(this.numNextLines);
                 resolve({ state, timedOut, sessionEnded });
             };
@@ -843,90 +1199,6 @@ export class DebuggingHandler implements IDebuggingHandler {
                 `Probe / GDB server may be wedged — call check_target_connection.`);
             return lines.join('\n');
         }
-    }
-
-    /**
-     * Wait for debugger state to change from the initial state using exponential backoff
-     */
-    private async waitForStateChange(beforeState: DebugState): Promise<DebugState> {
-        const baseDelay = 1000; // Start with 1 second
-        const maxDelay = 1000; // Cap at 1 second
-        const startTime = Date.now();
-        let attempt = 0;
-                
-        while (Date.now() - startTime < this.timeoutInSeconds * 1000) {
-            const currentState = await this.executor.getCurrentDebugState(this.numNextLines);
-            
-            if (this.hasStateChanged(beforeState, currentState)) {
-                return currentState;
-            }
-            
-            // If session ended, return immediately
-            if (!currentState.sessionActive) {
-                return currentState;
-            }
-            
-            logger.info(`[Attempt ${attempt + 1}] Waiting for debugger state to change...`);
-
-            // Calculate delay using exponential backoff with jitter (same as waitForActiveDebugSession)
-            const delay = Math.min(baseDelay * Math.pow(2, attempt), maxDelay);
-            const jitteredDelay = delay + Math.random() * 200; // Add up to 200ms jitter
-
-            await new Promise(resolve => setTimeout(resolve, jitteredDelay));
-            attempt++;
-        }
-        
-        // If we timeout, return the current state (might be unchanged)
-        logger.info('State change detection timed out, returning current state');
-        return await this.executor.getCurrentDebugState(this.numNextLines);
-    }
-
-    /**
-     * Determine if the debugger state has meaningfully changed
-     */
-    private hasStateChanged(beforeState: DebugState, afterState: DebugState): boolean {
-        if (beforeState.hasLocationInfo() && !afterState.hasLocationInfo() && afterState.sessionActive) {
-            return false;
-        }
-
-        // If session status changed, that's a meaningful change
-        if (beforeState.sessionActive !== afterState.sessionActive) {
-            return true;
-        }
-        
-        // If session is no longer active, that's a change
-        if (!afterState.sessionActive) {
-            return true;
-        }
-        
-        // If either state lacks location info, compare what we can
-        if (!beforeState.hasLocationInfo() || !afterState.hasLocationInfo()) {
-            // If one has location info and the other doesn't, that's a change
-            return beforeState.hasLocationInfo() !== afterState.hasLocationInfo();
-        }
-        
-        // Compare file paths - if we moved to a different file, that's a change
-        if (beforeState.fileFullPath !== afterState.fileFullPath) {
-            return true;
-        }
-        
-        // Compare line numbers - if we moved to a different line, that's a change
-        if (beforeState.currentLine !== afterState.currentLine) {
-            return true;
-        }
-        
-        // Compare frame names - if we moved to a different function/method, that's a change
-        if (beforeState.frameName !== afterState.frameName) {
-            return true;
-        }
-        
-        // Compare frame IDs - internal frame change
-        if (beforeState.frameId !== afterState.frameId) {
-            return true;
-        }
-        
-        // If we get here, no meaningful change was detected
-        return false;
     }
 
     /**
@@ -1062,6 +1334,35 @@ REQUIRED NEXT STEPS:
     }
 
     /**
+     * Read the DWT cycle counter for cycle-accurate timing. Enables trace +
+     * CYCCNT on first use (a one-time, benign debug-unit state change).
+     */
+    public async handleReadCycleCounter(args?: { timeoutMs?: number }): Promise<string> {
+        return withHandlerTimeout('read_cycle_counter', args?.timeoutMs, async () => {
+            await this.ensureStoppedSession('read cycle counter');
+
+            const reading = await this.executor.readCycleCounter(args?.timeoutMs);
+            if (!reading.present) {
+                return 'This core reports no DWT cycle counter (DWT_CTRL.NOCYCCNT=1) — read_cycle_counter is ' +
+                    'unavailable. Use an RTOS tick or a timer peripheral for timing instead.';
+            }
+
+            const hex = `0x${reading.cycles.toString(16).padStart(8, '0')}`;
+            let result = `DWT cycle counter: ${reading.cycles} (${hex})\n`;
+            if (reading.enabledNow) {
+                result += 'DWT was enabled during this call — deltas are valid from now.\n';
+            }
+            result += 'Wrap: 32-bit, wraps every 2^32 cycles (~10.7 s @ 400 MHz) — for longer spans, sample ' +
+                'repeatedly and accumulate.\n';
+            result += 'Note: CYCCNT stops while the core is halted and during WFE sleep — it counts ACTIVE ' +
+                'cycles only.\n';
+            result += 'To time a region: read here, continue_execution / wait_for_stop to the end point, read ' +
+                'again, subtract (mod 2^32).';
+            return result;
+        });
+    }
+
+    /**
      * Read peripheral register(s) via Peripheral Inspector or memory fallback
      */
     public async handleReadPeripheralRegister(args: { peripheral: string; register?: string; timeoutMs?: number }): Promise<string> {
@@ -1169,29 +1470,31 @@ REQUIRED NEXT STEPS:
     /**
      * Get variables for an explicit frame id (e.g. a caller frame from get_call_stack).
      */
-    public async handleGetFrameVariables(args: { frameId: number; scope?: 'local' | 'global' | 'all'; timeoutMs?: number }): Promise<string> {
-        const { frameId, scope = 'all', timeoutMs } = args;
+    public async handleGetFrameVariables(args: {
+        frameId: number;
+        scope?: 'local' | 'global' | 'all';
+        variableNames?: string[];
+        timeoutMs?: number;
+    }): Promise<string> {
+        const { frameId, scope = 'all', variableNames, timeoutMs } = args;
         return withHandlerTimeout('get_frame_variables', timeoutMs, async () => {
             await this.ensureStoppedSession('get frame variables');
             const variablesData = await this.executor.getVariablesForFrame(frameId, scope, timeoutMs);
-            if (!variablesData.scopes || variablesData.scopes.length === 0) {
+            const scopes = (variablesData.scopes ?? []) as DapScope[];
+            if (scopes.length === 0) {
                 return `No variable scopes available for frameId=${frameId}.`;
             }
-            let out = `Variables for frameId=${frameId}:\n==========\n\n`;
-            for (const scopeItem of variablesData.scopes) {
-                out += `${scopeItem.name}:\n`;
-                if (scopeItem.error) {
-                    out += `  Error retrieving variables: ${scopeItem.error}\n`;
-                } else if (scopeItem.variables && scopeItem.variables.length > 0) {
-                    for (const v of scopeItem.variables) {
-                        out += `  ${v.name}: ${v.value}${v.type ? ` (${v.type})` : ''}\n`;
-                    }
-                } else {
-                    out += '  No variables in this scope\n';
-                }
-                out += '\n';
+
+            const { scopes: selected, missing } = variableNames?.length
+                ? selectVariables(scopes, variableNames)
+                : { scopes, missing: [] as string[] };
+
+            if (variableNames?.length && selected.length === 0) {
+                return `None of the requested variables are in scope at frameId=${frameId}: ${variableNames.join(', ')}.`;
             }
-            return out;
+
+            return renderScopes(selected, { header: `Variables for frameId=${frameId}`, redact: this.redactor() })
+                + formatMissingNames(missing);
         });
     }
 
@@ -1275,6 +1578,101 @@ REQUIRED NEXT STEPS:
             return { stable: true, detail: `${first.detail}, ${second.detail} — target threads present` };
         }
         return { stable: false, detail: `${first.detail}, then ${second.detail}` };
+    }
+
+    /**
+     * Program the target flash via `pyocd load --cbuild-run` as a synchronous
+     * operation: bytes programmed + structured error, not "check the output
+     * channel". Refuses while a debug session is active — programming under
+     * a live session wedges most probes.
+     */
+    public async handleFlash(args: { cbuildRunFile?: string; timeoutMs?: number }): Promise<string> {
+        // Flash legitimately takes tens of seconds — default to the full
+        // budget like cmsis_action build/load does.
+        return withHandlerTimeout('flash', args?.timeoutMs ?? HARD_HANDLER_CAP_MS, async () => {
+            if (this.executor.hasDebugSession()) {
+                return 'Refusing to flash while a debug session is active — programming under a live session ' +
+                    'wedges most probes. Call stop_debugging first, then flash, then cmsis_action attach or load_and_debug.';
+            }
+            const resolved = await this.resolveCbuildRunFile(args.cbuildRunFile);
+            if ('error' in resolved) { return resolved.error; }
+            const version = await probePyocd();
+            if (!version) {
+                return 'pyocd not found on PATH. Install it (pip install pyocd / pipx install pyocd), or use ' +
+                    'cmsis_action load, which drives the CMSIS Solution extension\'s own flash pipeline.';
+            }
+            // Margin under the handler fence so the flash result (not the
+            // generic fence text) is what the agent sees at the deadline.
+            const budget = Math.max((args?.timeoutMs ?? HARD_HANDLER_CAP_MS) - 1_500, 1_000);
+            const result = await flashWithPyocd(resolved.path, budget);
+            if (result.timedOut) {
+                return `Flash timed out after ${Math.round(budget / 1000)} s — the pyOCD process was killed.\n` +
+                    `Output tail:\n  ${result.outputTail.join('\n  ') || '<no output>'}\n` +
+                    `Retry, or investigate why programming stalls (probe connection, target held in reset).`;
+            }
+            if (result.ok) {
+                const bytes = result.programmedBytes !== null ? ` — programmed ${result.programmedBytes} bytes` : '';
+                const rate = result.kbps !== null ? ` at ${result.kbps} kB/s` : '';
+                return `✅ Flash succeeded${bytes}${rate} (pyOCD ${version}: \`${result.commandLine}\`). ` +
+                    `Use cmsis_action attach or load_and_debug to start a debug session.`;
+            }
+            return `❌ Flash FAILED (exit ${result.exitCode ?? 'unknown'}) — \`${result.commandLine}\`\n` +
+                (result.errorLines.length > 0 ? `Errors:\n  ${result.errorLines.join('\n  ')}\n` : '') +
+                `Output tail:\n  ${result.outputTail.join('\n  ') || '<no output>'}\n` +
+                `This is a terminal result — fix the cause and re-run flash.`;
+        });
+    }
+
+    /**
+     * Resolve the cbuild-run.yml to program: the explicit argument, else the
+     * active launch.json's `cmsis.cbuildRunFile` (${command:...} references
+     * cannot be resolved here and are skipped, same as the SVD resolver),
+     * else a recursive out/ scan (cbuild-run files nest as
+     * out/<project>/<target>/<build>/). Ambiguity is an error that names the
+     * candidates, never a silent pick.
+     */
+    private async resolveCbuildRunFile(explicit?: string): Promise<{ path: string } | { error: string }> {
+        const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
+        if (explicit) {
+            const resolved = path.isAbsolute(explicit)
+                ? explicit
+                : (workspaceFolder ? path.join(workspaceFolder.uri.fsPath, explicit) : explicit);
+            if (!fileExists(resolved)) {
+                return { error: `cbuild-run file not found: ${resolved}. Pass an existing path, or omit ` +
+                    `cbuildRunFile to auto-resolve from launch.json / out/.` };
+            }
+            return { path: resolved };
+        }
+        if (!workspaceFolder) {
+            return { error: 'No workspace folder open and no cbuildRunFile argument given — cannot resolve what to flash.' };
+        }
+
+        try {
+            const launchJsonPath = vscode.Uri.joinPath(workspaceFolder.uri, '.vscode', 'launch.json');
+            const doc = await vscode.workspace.openTextDocument(launchJsonPath);
+            const launchConfig = jsonc.parse(doc.getText());
+            const configs: any[] = Array.isArray(launchConfig?.configurations) ? launchConfig.configurations : [];
+            for (const config of configs) {
+                const candidate = config?.cmsis?.cbuildRunFile;
+                if (typeof candidate === 'string' && candidate.length > 0 && !candidate.includes('${command:')) {
+                    const resolved = path.isAbsolute(candidate) ? candidate : path.join(workspaceFolder.uri.fsPath, candidate);
+                    if (fileExists(resolved)) { return { path: resolved }; }
+                }
+            }
+        } catch {
+            // No launch.json or unparseable — fall through to the out/ scan.
+        }
+
+        const matches = await vscode.workspace.findFiles('out/**/*.cbuild-run.yml', '**/node_modules/**', 10);
+        if (matches.length === 1) {
+            return { path: matches[0].fsPath };
+        }
+        if (matches.length > 1) {
+            return { error: `Found ${matches.length} cbuild-run files under out/ — pass cbuildRunFile explicitly:\n` +
+                `  ${matches.map(m => m.fsPath).join('\n  ')}` };
+        }
+        return { error: 'No cbuild-run file found (launch.json has no resolvable cmsis.cbuildRunFile and out/ has ' +
+            'none). Build first (cmsis_action build), or pass cbuildRunFile explicitly.' };
     }
 
     /**
@@ -1367,7 +1765,8 @@ REQUIRED NEXT STEPS:
                             `cannot select one for you.`;
                     } else {
                         commandFailed = `CMSIS command '${cmd}' failed: ${error}. ` +
-                            `Ensure the CMSIS Solution extension is installed and a solution context is active.`;
+                            `Ensure the CMSIS Solution extension is installed and a solution context is active.` +
+                            this.diagnosticsSuffix();
                     }
                 });
 
@@ -1405,14 +1804,16 @@ REQUIRED NEXT STEPS:
                         `connect — ${survived.detail}. ` +
                         `For 'attach' this almost always means no GDB server is listening on the configured port: ` +
                         `start the GDB server first, or use 'load_and_debug' (which launches one). ` +
-                        `Confirm with get_session_status / check_target_connection.`;
+                        `Confirm with get_session_status / check_target_connection.` +
+                        this.diagnosticsSuffix();
                 }
                 return `CMSIS '${args.action}' issued via '${cmd}'. The flash/connect pipeline is running in the ` +
                     `CMSIS extension (a multi-core flash + attach typically takes 20-40 s). This tool does not ` +
                     `block for the whole pipeline — poll get_session_status until it reports 'running' or ` +
                     `'stopped'. If get_session_status keeps reporting 'no-session' with liveSessionsInThisWindow=0, ` +
-                    `the CMSIS panel may be showing a picker the user must resolve, or the debug session is in a ` +
-                    `different VS Code window than this MCP server.`;
+                    `the CMSIS panel is most likely showing a picker the user must resolve. Less often, this call ` +
+                    `and the poll landed in different windows — check with list_debug_windows and pin one with ` +
+                    `select_debug_window.`;
             }
 
             // build / load / erase / load_and_run — wait for the cbuild/flash
@@ -1551,11 +1952,12 @@ REQUIRED NEXT STEPS:
             case 'no-session':
                 if (diag.liveSessionCount === 0) {
                     lines.push(
-                        'Hint: no debug session is visible to THIS extension host. Either no session is ' +
-                        'running, OR the debug session is in a different VS Code window (each window runs ' +
-                        'its own extension host + MCP server — they cannot see each other). Confirm the ' +
-                        'debug session and this MCP server are in the same VS Code window. If you just ' +
-                        'reinstalled the extension, reload the window so the new build is active.'
+                        'Hint: no debug session is running in the VS Code window this call was routed to. ' +
+                        'Start one with cmsis_action load_and_debug (CMSIS targets) or start_debugging. ' +
+                        'If a session IS running and you expected to reach it, it is in a different ' +
+                        'window: call list_debug_windows to see which windows are registered and which ' +
+                        'one holds the session, then select_debug_window to pin it for this session. ' +
+                        'If you just reinstalled the extension, reload the window so the new build is active.'
                     );
                 } else {
                     lines.push('Hint: call start_debugging or cmsis_action load_and_debug to attach.');

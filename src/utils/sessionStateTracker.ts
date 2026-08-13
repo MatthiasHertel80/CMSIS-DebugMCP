@@ -22,6 +22,8 @@ interface SessionExecState {
     lastEvent: 'stopped' | 'continued' | null;
     /** Reason from the DAP `stopped` event (e.g. "breakpoint", "step", "exception"). */
     stoppedReason: string | null;
+    /** Thread from the DAP `stopped` event, when the adapter reported one. */
+    stoppedThreadId: number | null;
     /** Wall-clock time of the last transition. */
     lastEventAt: number;
 }
@@ -43,7 +45,7 @@ const liveSessions: vscode.DebugSession[] = [];
 function getOrInit(session: vscode.DebugSession): SessionExecState {
     let state = sessionStates.get(session);
     if (!state) {
-        state = { lastEvent: null, stoppedReason: null, lastEventAt: 0 };
+        state = { lastEvent: null, stoppedReason: null, stoppedThreadId: null, lastEventAt: 0 };
         sessionStates.set(session, state);
     }
     return state;
@@ -123,6 +125,87 @@ export function getStoppedReason(session: vscode.DebugSession): string | null {
     return state?.lastEvent === 'stopped' ? state.stoppedReason : null;
 }
 
+// ── Awaitable stop events ─────────────────────────────────────────
+
+/** Outcome of waiting for the next DAP `stopped` event on a session. */
+export type StopWaitResult =
+    | { kind: 'stopped'; reason: string | null; threadId: number | null }
+    | { kind: 'timeout' }
+    | { kind: 'ended' };
+
+interface StopWaiter {
+    session: vscode.DebugSession;
+    settle: (result: StopWaitResult) => void;
+    timer: NodeJS.Timeout;
+}
+
+// Module-level waiter set because the tracker is a singleton. A Set (not a
+// single slot) so concurrent waiters on the same session all settle.
+const stopWaiters = new Set<StopWaiter>();
+
+function settleStopWaiters(session: vscode.DebugSession, result: StopWaitResult): void {
+    for (const waiter of [...stopWaiters]) {
+        if (waiter.session === session) {
+            waiter.settle(result);
+        }
+    }
+}
+
+/**
+ * Resolve on the NEXT DAP `stopped` event for this session (ground truth —
+ * the same signal isSessionStopped records), on session termination, or on
+ * timeout. Never rejects; the caller distinguishes outcomes via `kind`.
+ */
+export function waitForStopEvent(session: vscode.DebugSession, timeoutMs: number): Promise<StopWaitResult> {
+    const ms = Math.min(Math.max(timeoutMs, 100), 60_000);
+    return new Promise((resolve) => {
+        const waiter = {} as StopWaiter;
+        const settle = (result: StopWaitResult) => {
+            stopWaiters.delete(waiter);
+            clearTimeout(waiter.timer);
+            resolve(result);
+        };
+        waiter.session = session;
+        waiter.settle = settle;
+        waiter.timer = setTimeout(() => settle({ kind: 'timeout' }), ms);
+        stopWaiters.add(waiter);
+    });
+}
+
+// ── Recent adapter traffic (launch-failure diagnostics) ───────────
+
+// Ring buffer of recent adapter-originated error/output lines, keyed by
+// session.id (NOT the WeakMap — these must survive session termination,
+// which is exactly when launch-failure reporting needs them). Retained for
+// the last few sessions only.
+const DIAG_RING_SIZE = 20;
+const DIAG_LINE_CAP = 300;
+const DIAG_KEPT_SESSIONS = 3;
+const diagnosticsBySessionId = new Map<string, string[]>();
+
+function recordDiagnostic(session: vscode.DebugSession, line: string): void {
+    const trimmed = line.length > DIAG_LINE_CAP ? line.substring(0, DIAG_LINE_CAP - 1) + '…' : line;
+    let buffer = diagnosticsBySessionId.get(session.id);
+    if (!buffer) {
+        buffer = [];
+        diagnosticsBySessionId.set(session.id, buffer);
+        // Prune oldest session ids (Map preserves insertion order).
+        while (diagnosticsBySessionId.size > DIAG_KEPT_SESSIONS) {
+            const oldest = diagnosticsBySessionId.keys().next().value!;
+            if (oldest === session.id) { break; }
+            diagnosticsBySessionId.delete(oldest);
+        }
+    }
+    buffer.push(trimmed);
+    if (buffer.length > DIAG_RING_SIZE) { buffer.shift(); }
+}
+
+/** The most recent session's captured adapter errors/output, oldest first. */
+export function getRecentDiagnostics(): string[] {
+    const last = [...diagnosticsBySessionId.values()].pop();
+    return last ? [...last] : [];
+}
+
 /**
  * Register a global DebugAdapterTracker that records `stopped` and
  * `continued` events for every debug session VS Code starts. Call once
@@ -134,29 +217,53 @@ export function registerSessionStateTracker(context: vscode.ExtensionContext): v
             addLiveSession(session);
             return {
                 onDidSendMessage(message: any): void {
+                    // Failed request responses carry the adapter's own error
+                    // text — the detail start_debugging failures otherwise
+                    // leave in the extension-host log.
+                    if (message?.type === 'response' && message.success === false) {
+                        recordDiagnostic(session, `error response to '${message.command}': ${message.message ?? '<no message>'}`);
+                        return;
+                    }
                     if (message?.type !== 'event') { return; }
+                    if (message.event === 'output') {
+                        // Adapter stderr/console/important output (GDB server
+                        // banners, connect errors). stdout is deliberately
+                        // excluded — chatty target printf would flush real
+                        // errors out of the ring.
+                        const category = message.body?.category;
+                        if (category === 'stderr' || category === 'console' || category === 'important') {
+                            recordDiagnostic(session, `[${category}] ${String(message.body?.output ?? '').trim()}`);
+                        }
+                        return;
+                    }
                     const state = getOrInit(session);
                     if (message.event === 'stopped') {
                         state.lastEvent = 'stopped';
                         state.stoppedReason = message.body?.reason ?? null;
+                        state.stoppedThreadId = message.body?.threadId ?? null;
                         state.lastEventAt = Date.now();
                         logger.debug(`[session-tracker] stopped (${state.stoppedReason}) on ${session.name}`);
+                        settleStopWaiters(session, { kind: 'stopped', reason: state.stoppedReason, threadId: state.stoppedThreadId });
                     } else if (message.event === 'continued') {
                         state.lastEvent = 'continued';
                         state.stoppedReason = null;
+                        state.stoppedThreadId = null;
                         state.lastEventAt = Date.now();
                         logger.debug(`[session-tracker] continued on ${session.name}`);
                     } else if (message.event === 'terminated' || message.event === 'exited') {
                         sessionStates.delete(session);
                         removeLiveSession(session);
+                        settleStopWaiters(session, { kind: 'ended' });
                     }
                 },
                 onWillStopSession(): void {
                     sessionStates.delete(session);
                     removeLiveSession(session);
+                    settleStopWaiters(session, { kind: 'ended' });
                 },
                 onError(error: Error): void {
                     logger.debug(`[session-tracker] adapter error on ${session.name}`, error);
+                    recordDiagnostic(session, `adapter error: ${error.message ?? String(error)}`);
                 },
             };
         },
@@ -173,6 +280,7 @@ export function registerSessionStateTracker(context: vscode.ExtensionContext): v
         vscode.debug.onDidTerminateDebugSession((session) => {
             sessionStates.delete(session);
             removeLiveSession(session);
+            settleStopWaiters(session, { kind: 'ended' });
         }),
     );
 

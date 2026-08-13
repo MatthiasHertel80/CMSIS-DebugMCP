@@ -1,13 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 
 import * as vscode from 'vscode';
-import { DebugMCPServer } from './debugMCPServer';
 import { SERVER_VERSION } from './debuggingExecutor';
 import { AgentConfigurationManager } from './utils/agentConfigurationManager';
+import { clearSvdCache } from './core/svdParser';
 import { logger, LogLevel } from './utils/logger';
 import { registerSessionStateTracker } from './utils/sessionStateTracker';
+import { WindowCoordinator } from './windowCoordinator';
 
-let mcpServer: DebugMCPServer | null = null;
+let coordinator: WindowCoordinator | null = null;
 let agentConfigManager: AgentConfigurationManager | null = null;
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -31,35 +32,65 @@ export async function activate(context: vscode.ExtensionContext) {
     // currently paused?" reliably, regardless of what activeStackItem says.
     registerSessionStateTracker(context);
 
+    // Drop the parsed-SVD cache when a debug session ends — the next session
+    // may target a different device, and the module-level cache in svdParser
+    // has no other invalidation path.
+    context.subscriptions.push(
+        vscode.debug.onDidTerminateDebugSession(() => clearSvdCache()),
+    );
+
     // Initialize Agent Configuration Manager
     agentConfigManager = new AgentConfigurationManager(context, timeoutInSeconds, serverPort);
 
-    // Initialize MCP Server
+    // Put the bundled agent skill where skills-aware harnesses look for it.
+    // Done here rather than only on agent registration: the skill is
+    // agent-independent, and a user who registered their agents in an earlier
+    // release never opens that dialog again — so gating it there meant every
+    // upgrading user silently got no skill.
     try {
-        logger.info('Starting MCP server initialization...');
-        
-        mcpServer = new DebugMCPServer(serverPort, timeoutInSeconds, {
-            dapRequestMs: dapRequestTimeoutMs,
-            memoryReadMs: memoryReadTimeoutMs,
-        });
-        await mcpServer.initialize();
-        await mcpServer.start();
+        const skillPath = await agentConfigManager.installCmsisDebugSkill();
+        logger.info(skillPath
+            ? `Installed the cmsis-debug-live agent skill at ${skillPath}`
+            : 'No agent skill was installed (bundle missing or skills dir unwritable)');
+    } catch (error) {
+        logger.error('Error installing the agent skill', error);
+    }
 
-        // The server may have fallen back to an OS-assigned port if the
-        // configured port was already in use by another IDE window.
-        const actualPort = mcpServer.getActualPort();
-        if (actualPort !== serverPort) {
-            logger.info(`Configured port ${serverPort} was busy – server is on port ${actualPort}`);
+    // Start this window's coordinator: it always runs a control server and
+    // publishes the window to the shared registry, then tries to claim the
+    // well-known port. Exactly one window wins and serves MCP; the rest execute
+    // work forwarded to them.
+    try {
+        logger.info('Starting CMSIS-DebugMCP window coordinator...');
+
+        coordinator = new WindowCoordinator({
+            port: serverPort,
+            timeoutInSeconds,
+            hardwareTimeouts: {
+                dapRequestMs: dapRequestTimeoutMs,
+                memoryReadMs: memoryReadTimeoutMs,
+            },
+        });
+        await coordinator.start(context);
+
+        // Every window advertises the *router's* endpoint, never its own
+        // control port. That is the whole point: agents get one stable URL,
+        // and the router forwards each call to the window that owns the
+        // target. Writing a per-window port here is what used to send an
+        // agent to a window that did not have the board.
+        const endpoint = coordinator.getEndpoint();
+        agentConfigManager.updatePort(serverPort);
+
+        const role = coordinator.isRouter() ? 'router' : 'worker';
+        logger.info(`CMSIS-DebugMCP is up as ${role}; agents should use ${endpoint}`);
+        if (coordinator.isRouter()) {
+            vscode.window.showInformationMessage(`CMSIS-DebugMCP server running on ${endpoint}`);
         }
-        agentConfigManager.updatePort(actualPort);
-        
-        const endpoint = mcpServer.getEndpoint();
-        logger.info(`CMSIS-DebugMCP server running at: ${endpoint}`);
-        vscode.window.showInformationMessage(`CMSIS-DebugMCP server running on ${endpoint}`);
 
         // Register as a VS Code MCP server definition provider so Copilot
         // discovers this server without a static mcp.json entry (which
-        // causes race conditions on startup).
+        // causes race conditions on startup). Workers point at the router too,
+        // so in-window Copilot routes exactly like an external agent.
         const mcpUri = vscode.Uri.parse(`${endpoint}/mcp`);
         context.subscriptions.push(
             vscode.lm.registerMcpServerDefinitionProvider('cmsis-debugmcp', {
@@ -171,12 +202,14 @@ function registerCommands(context: vscode.ExtensionContext) {
 export async function deactivate() {
     logger.info('CMSIS-DebugMCP extension deactivating...');
 
-    // Clean up MCP server
-    if (mcpServer) {
-        mcpServer.stop().catch(error => {
-            logger.error('Error stopping MCP server', error);
+    // Awaited, unlike before: the coordinator has to remove this window from
+    // the shared registry before the host goes away, or other windows keep
+    // forwarding to a dead control port until the entry goes stale.
+    if (coordinator) {
+        await coordinator.dispose().catch(error => {
+            logger.error('Error stopping CMSIS-DebugMCP window coordinator', error);
         });
-        mcpServer = null;
+        coordinator = null;
     }
 
     logger.info('CMSIS-DebugMCP extension deactivated');

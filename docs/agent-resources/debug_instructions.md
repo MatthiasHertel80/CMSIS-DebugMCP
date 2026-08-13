@@ -167,14 +167,30 @@ Before stopping your debug session, ensure you can answer:
 ## Breakpoint Strategy Guide
 
 🎯 **BREAKPOINT STRATEGY:**
+- **Pass `line` (1-based), not `lineContent`.** `lineContent` is deprecated: it substring-matches and sets a breakpoint on *every* line containing the text. In C that routinely means dozens of lines — `}`, `return;`, `break;` — and it will exhaust the FPB comparators (see below) before you notice.
 - Set breakpoints inside the function body and not on the signature or definition line itself (e.g "def" in python)
 - Place breakpoints only on executable lines (avoid comments, empty lines)
 - Set breakpoints before loops or conditionals  
 - Set breakpoints at variable assignments you want to inspect
 - Set breakpoints at error-prone areas
 - Set breakpoints at the start of functions to inspect parameters
-- Use conditional breakpoints for loops that iterate many times
 - Set breakpoints before and after critical operations
+
+### Conditional breakpoints
+
+Pass `condition` to `add_breakpoint` (e.g. `i == 100`, `p != 0`, `state == FSM_ERROR`) instead of hitting a breakpoint hundreds of times. The condition becomes GDB's native `if` clause, so **the core is only halted when it holds** — a host-side condition would still stop the CPU on every hit and decide afterwards, which wrecks timing in a hot loop or an ISR. `list_breakpoints` shows conditions as `file:line [when: ...]`.
+
+### Logpoints — useful, but not free on Cortex-M
+
+`add_logpoint` prints a message and resumes instead of pausing. Embed expressions in braces: `"adc={sample} state={fsm}"`.
+
+GDB infers nothing about types, so specifiers are explicit:
+
+- `{expr}` → `%d` (the common embedded case)
+- `{expr:%s}` / `{expr:%f}` / `{expr:%p}` / `{expr:%08lx}` → that specifier
+- `{{` and `}}` → literal braces
+
+⚠️ **The core still halts on every hit** while GDB formats and prints, then resumes. In an ISR or a hot loop this distorts the very timing you are usually trying to observe. For high-rate tracing prefer `read_cycle_counter` around the region, or have the firmware fill a RAM buffer that you read back with `read_memory`.
 
 ### ⚠️ Cortex-M hardware breakpoint limit
 
@@ -199,6 +215,38 @@ Defensive defaults:
 
 Software breakpoints (which Flash patches without a comparator) are *not* an option on Flash for most Cortex-M targets — only RAM-resident code can use them, which is rarely the case here.
 
+## ⏱️ Embedded execution control: wait_for_stop, reset, cycle timing
+
+**Never sleep blind waiting for a stop.** After `continue_execution` returned while the target was still running (timeout), or after issuing execution through `evaluate_expression` (`-exec continue`), call `wait_for_stop` — it blocks on the raw DAP `stopped` event and returns the stop reason + state, or a structured timeout. It returns immediately if the target is already stopped, and it issues no execution commands itself.
+
+**`reset` vs `restart_debugging`.** `restart_debugging` restarts the whole VS Code session (re-launch, breakpoints re-bound). `reset` resets only the target *inside* the live session — the session and breakpoints survive — and verifies the outcome: after the reset-halt the PC must equal the reset vector, or the tool says the target did NOT appear to reset. Trust the verification, not the command echo. Methods: `auto` (escalates `system` → `core` → `hardware`), `system` (SYSRESETREQ), `core` (VECTRESET), `hardware` (nSRST — only works when the reset line is wired from probe to target; if it isn't, no software reset can recover a wedge — power-cycle).
+
+**Cycle-accurate timing with `read_cycle_counter`.** Read the DWT cycle counter at point A, run to point B (`continue_execution` / `wait_for_stop`), read again, subtract mod 2^32. Caveats that bite: the 32-bit counter wraps (~10.7 s @ 400 MHz — accumulate over longer spans), and CYCCNT **stops while the core is halted and during WFE sleep** — it counts ACTIVE cycles only, so a delta excludes halted debug time and sleep.
+
+## 🔬 Inspecting variables: discover, then read
+
+`list_variable_names` reports what is in scope by **name and type only**, reading no values. `get_variables_values` then reads them — pass `variableNames` to fetch just what you need, or omit it to dump the whole scope.
+
+- On a **slow probe or a large frame**, discover first and then request two names instead of thirty. That is one round trip instead of thirty.
+- On a small frame, omitting `variableNames` is fine and usually what you want — embedded frames are small.
+- Names that match nothing are reported back explicitly, so a typo does not look like "the variable does not exist".
+- To inspect a **caller's** frame without disturbing the active one: `get_call_stack` → take a `frameId` → `get_frame_variables`.
+
+### Secret redaction
+
+Values whose name or content looks like a credential are withheld before leaving the extension (`<redacted: possible secret>`), controlled by `cmsis-debugmcp.redactSecrets` (default on).
+
+This is tuned for firmware and should rarely get in your way:
+
+- **Numeric scalars are never withheld** — a `uint8_t auth`, a `token` counter, or `0xDEADBEEF` stays readable whatever it is called.
+- **Raw target reads are never redacted**: `read_memory`, `read_core_registers`, `read_peripheral_register`, `get_fault_info`, and `-exec` GDB passthrough through `evaluate_expression`. Real SVDs name registers `KEY`, `KR`, `KEYR` and `UNLOCK` — the watchdog and flash unlock registers — and those are exactly what you need when the watchdog is resetting you.
+
+## 🪟 Several VS Code windows open
+
+The MCP server runs in one window (the router) and forwards each call to the window that owns the target. It resolves from a file path when the tool has one, otherwise from the window that has an active debug session.
+
+When **two windows are debugging at once** it refuses to guess and names both — reading the wrong board's memory looks exactly like a firmware bug and costs far more than being asked to pick. Use `list_debug_windows` to see the candidates and `select_debug_window({ pid })` to pin one for the rest of the session.
+
 ## Common Patterns:
 ❌ **COMMON MISTAKE:** Starting debugging without breakpoints
 ✅ **BEST PRACTICE:** Always set an initial breakpoint before starting debugging
@@ -208,6 +256,12 @@ Software breakpoints (which Flash patches without a comparator) are *not* an opt
 ✅ **BEST PRACTICE:** Set breakpoint only on executable lines.
 ❌ **COMMON MISTAKE:** Step over the problematic line without fully understanding why the issue occured.
 ✅ **BEST PRACTICE:** Stop the session, set breakpoint in the problematic line and restart the session.
+❌ **COMMON MISTAKE:** Locating a breakpoint with `lineContent` — it matches every line containing that text.
+✅ **BEST PRACTICE:** Pass the 1-based `line` number.
+❌ **COMMON MISTAKE:** Hitting a breakpoint 500 times to reach one iteration.
+✅ **BEST PRACTICE:** Pass `condition` so GDB only halts the core when it holds.
+❌ **COMMON MISTAKE:** Dumping every variable in a large frame over a slow probe.
+✅ **BEST PRACTICE:** `list_variable_names` first, then `get_variables_values` with `variableNames`.
 
 ## 🧹 CLEANUP AFTER ROOT CAUSE VERIFICATION
 

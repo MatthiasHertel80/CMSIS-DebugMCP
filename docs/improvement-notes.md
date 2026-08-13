@@ -14,22 +14,23 @@ DebugMCP. This is a living document — keep it in sync as items ship.
 |---|------|-----------|
 | 1 (build half) | Synchronous build result — `cmsis_action build` now waits for the cbuild task and returns the real exit code (✅/❌), never "check the output channel". | 1.2.1 |
 | — | Attach zombie-detection — `cmsis_action attach` distinguishes a real connection (≥1 thread) from a phantom `gdbtarget` session with no target behind the port. | 1.1.7–1.1.9 |
+| 1 (flash half) | Synchronous flash result — new `flash` tool wraps `pyocd load --cbuild-run` and returns bytes programmed + structured flash error; refuses under an active session. `cmsis_action load` keeps the task-exit-code path. | unreleased |
+| 3 | Verified reset — new `reset` tool with method selection (auto/system/core/hardware) and PC-vs-reset-vector verification; reports honestly when the target did not reset. | unreleased |
+| 4 | Cycle-accurate timing — new `read_cycle_counter` (DWT CYCCNT with enable, NOCYCCNT detection, wrap/halt/WFE caveats). | unreleased |
+| 6 | Wait-for-stop — new `wait_for_stop(timeoutMs)` blocks on the raw DAP `stopped` event and returns the reason + state, or a structured timeout. | unreleased |
+| 7 | Launch-failure diagnostics — recent adapter traffic (failed DAP responses, stderr/console output) is captured per session and appended to `start_debugging` / `cmsis_action` failure reports. | unreleased |
 
 **Top remaining (priority order)**
 
-1. **Synchronous flash result for `load`** — apply the same task-exit-code
-   treatment as `build` to `load` / `load_and_run` (item 1 below). `load`
-   already waits for the task as of 1.2.1, but confirm it reports bytes
-   programmed / a real flash error, not just an exit code.
-2. **Reset with verification** — silent non-resets and SWD wedges from
-   unsequenced resets bit us repeatedly (item 3).
-3. **`wait_for_stop`** — block until the next stop instead of sleeping blind
-   (item 6).
-4. **Launch-failure diagnostics passthrough** — surface the underlying DAP/task
-   error instead of one opaque line (item 7).
-5. **pyocd-gdbserver as a documented fallback path** — when the VS Code launch
+1. **pyocd-gdbserver as a documented fallback path** — when the VS Code launch
    pipeline can't spawn a server, bring one up / document the manual path
    (item 2).
+2. **RTOS time / uptime** — RTOS-aware `get_kernel_time`, or document the
+   inferior-call pattern (item 5).
+3. **Host-side USB enumeration checks** — tiny `list_usb_devices` utility for
+   bring-up (item 8).
+4. **Post-mortem with broken debug access** — `reconnect_probe` or automatic
+   retry-with-reconnect inside read_memory (item 9).
 
 ---
 
@@ -38,8 +39,10 @@ DebugMCP. This is a living document — keep it in sync as items ship.
 ### 1. Flashing (bypassed with `pyocd load --cbuild-run <file>`)
 - `cmsis_action load` is fire-and-forget ("check the CMSIS output channel")
   — an agent cannot read that channel, so success/failure is unknowable.
-  *(Partly addressed in 1.2.1: `load` now waits for the cbuild/flash task and
-  returns its exit code. Still want bytes-programmed / structured flash error.)*
+  *(Addressed in two steps: 1.2.1 made `load` wait for the cbuild/flash task
+  and return its exit code; the new `flash` tool wraps
+  `pyocd load --cbuild-run` and returns bytes programmed / a structured flash
+  error synchronously.)*
 - `start_debugging` with a launch config that has a `CMSIS Load` preLaunchTask
   failed opaquely; the attach config cannot flash at all.
 - Suggestion: develop a status channel for flash programming

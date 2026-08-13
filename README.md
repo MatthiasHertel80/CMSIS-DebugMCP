@@ -8,7 +8,7 @@ Works with **GitHub Copilot**, **Claude Code**, **Claude Desktop**, **Cline**, *
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.104.0+-blue.svg)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-1.2.1-green.svg)](https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases)
+[![Version](https://img.shields.io/badge/version-2.0.3-green.svg)](https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases)
 
 <p align="center">
   <img src="assets/DebugMCP.webp" alt="CMSIS-DebugMCP Demo" width="800">
@@ -19,10 +19,16 @@ Works with **GitHub Copilot**, **Claude Code**, **Claude Desktop**, **Cline**, *
 - [Features](#features)
 - [Installation](#installation)
 - [Quick Start — CMSIS Target](#quick-start--cmsis-target)
-- [Supported Languages](#supported-languages)
+- [Quick Start — General Languages](#quick-start--general-languages)
+- [Supported Languages & Targets](#supported-languages--targets)
 - [Configuration](#configuration)
+- [FAQ](#faq)
 - [Troubleshooting](#troubleshooting)
+- [How It Works](#how-it-works)
+- [Requirements](#requirements)
+- [Development](#development)
 - [Contributing](#contributing)
+- [Security](#security)
 - [License](#license)
 
 ## Overview
@@ -50,14 +56,18 @@ CMSIS-DebugMCP is an MCP server that gives AI coding agents full control over th
 | **pause_execution** | DAP `pause` — halt a running target without ending the session. No-op if already stopped. | `timeoutMs` (optional) |
 | **step_over** / **step_into** / **step_out** | Step. Auto-heals on timeout: pauses the running target, reads PC + frame, reports where the firmware actually was. | `timeoutMs` (optional) |
 | **continue_execution** | Resume execution. Same auto-heal-on-timeout behavior. | `timeoutMs` (optional) |
-| **add_breakpoint** | Add a breakpoint at a specific line. State-aware hint when the session is running. | `fileFullPath`<br>`lineContent` |
+| **wait_for_stop** | Block until the target next stops (breakpoint, fault, step, pause) and return the stop reason + state, or a structured timeout. Replaces blind sleeping after an async continue. Issues no execution commands itself. | `timeoutMs` (optional) |
+| **add_breakpoint** | Add a breakpoint at a 1-based line, optionally conditional. The condition becomes GDB's native `if`, so the core is only halted when it holds. State-aware hint when the session is running. | `fileFullPath`<br>`line`<br>`condition` (optional)<br>`lineContent` (deprecated) |
+| **add_logpoint** | Print a message and resume instead of halting, via GDB `dprintf`. `{expr}` interpolates as `%d`; `{expr:%s}` overrides the specifier. Note: the core still halts per hit to print. | `fileFullPath`<br>`line`<br>`logMessage`<br>`condition` (optional) |
 | **remove_breakpoint** | Remove a breakpoint | `fileFullPath`<br>`line` |
 | **clear_all_breakpoints** / **list_breakpoints** | Breakpoint set management | None |
-| **get_variables_values** | Variables at the active frame | `scope` (`local` / `global` / `all`)<br>`timeoutMs` (optional) |
+| **list_variable_names** | Names and types in scope, reading no values. Discover first, then read only what you need. | `scope` (optional)<br>`timeoutMs` (optional) |
+| **get_variables_values** | Variables at the active frame. Omit `variableNames` for the whole scope, or name up to 50 to read just those. | `scope` (`local` / `global` / `all`)<br>`variableNames` (optional)<br>`timeoutMs` (optional) |
 | **evaluate_expression** | Evaluate an expression in the current frame | `expression`<br>`timeoutMs` (optional) |
 | **get_call_stack** | Full DAP stackTrace with `frameId` per frame | `threadId` (optional)<br>`levels` (optional, ≤200)<br>`timeoutMs` (optional) |
 | **get_threads** | DAP threads enumeration. With RTOS-aware GDB servers (pyOCD `--rtos`, J-Link plugin) returns FreeRTOS / RTX / ThreadX tasks. | `timeoutMs` (optional) |
-| **get_frame_variables** | Inspect variables at an explicit `frameId` without changing the active editor frame | `frameId`<br>`scope` (optional)<br>`timeoutMs` (optional) |
+| **get_frame_variables** | Inspect variables at an explicit `frameId` without changing the active editor frame | `frameId`<br>`scope` (optional)<br>`variableNames` (optional)<br>`timeoutMs` (optional) |
+| **list_debug_windows** / **select_debug_window** | Show the VS Code windows the server can drive, and pin one for this session. Registered only when routing. | `pid` or `workspaceFolder` |
 
 ### 🧠 Embedded / Cortex-M Tools
 
@@ -65,6 +75,9 @@ CMSIS-DebugMCP is an MCP server that gives AI coding agents full control over th
 |------|-------------|------------|
 | **read_memory** | Read a range of bytes from the target. DAP `readMemory` with multi-strategy GDB fallback. | `address` (hex)<br>`length` (1-4096)<br>`format` (`hex` / `ascii` / `both`)<br>`timeoutMs` (optional) |
 | **read_core_registers** | Read Cortex-M core registers (R0–R15, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK). Parallel evaluates with overall and per-request deadlines. | `timeoutMs` (optional) |
+| **read_cycle_counter** | DWT cycle counter (CYCCNT) for cycle-accurate timing between two stops. Enables trace + counter on first use; reports NOCYCCNT cores honestly; documents the 2³² wrap and halt/WFE stalls. | `timeoutMs` (optional) |
+| **reset** | Reset the target inside the live session (breakpoints survive) and VERIFY the reset took effect — PC is compared against the reset vector. Method selection (`auto`/`system`/`core`/`hardware`); honest "did NOT reset" reporting. | `method` (optional)<br>`halt` (optional)<br>`timeoutMs` (optional) |
+| **flash** | Program target flash via `pyocd load --cbuild-run` — synchronous bytes-programmed / structured flash error. Refuses while a debug session is active. | `cbuildRunFile` (optional)<br>`timeoutMs` (optional) |
 | **read_peripheral_register** | Read peripheral registers using SVD definitions (via Peripheral Inspector or SVD fallback) | `peripheral`<br>`register` (optional)<br>`timeoutMs` (optional) |
 | **get_fault_info** | Read and decode CFSR / HFSR / DFSR / MMFAR / BFAR / AFSR for HardFault analysis | `timeoutMs` (optional) |
 | **get_device_info** | Return session info: device, probe, processor, GDB server, ports, cbuild-run reference | None |
@@ -109,10 +122,13 @@ These are engineering invariants the agent can rely on — see [CHANGES-VS-UPSTR
 - **No MCP tool call exceeds 60 s.** Every hardware-touching handler is wrapped in a handler-level `Promise.race` against a deadline. Server-supplied cap clamps any agent-supplied `timeoutMs` to ≤60 000 ms.
 - **No DAP request hangs the call.** Every `customRequest` goes through `customRequestWithTimeout` and rejects with `HardwareTimeoutError` past its deadline.
 - **Inspection tools never lie about state.** If the target is running, the call returns a state-aware error pointing at the correct recovery tool (`pause_execution` / `add_breakpoint` / `continue_execution`) — not a misleading "no debug session".
-- **Concurrent tool calls don't trample each other.** Per-request `McpServer` + transport pair (matches the official MCP stateless example), eliminating the shared-server race.
+- **Concurrent tool calls don't trample each other.** Each MCP session gets its own `McpServer` + transport pair, created on `initialize` and never closed mid-flight, so one call cannot strip another's transport.
 - **Motion timeouts always produce actionable output.** `continue_execution` / `step_*` auto-heal: on overshoot they pause the target, read PC + active frame, and tell you where the firmware actually was.
+- **`reset` never claims a reset that didn't happen.** The PC is verified against the reset vector afterwards; an unverified reset is reported as "did NOT appear to reset" with the adapter's own replies.
 - **`start_debugging` / `cmsis_action load_and_debug` refuse duplicates** with a structured message naming the existing session.
-- **Local & credential-free.** The MCP server runs 100% on localhost; nothing leaves the machine.
+- **Calls never run against the wrong board.** When more than one window could be meant, routing fails with an error naming every candidate instead of picking one. Reading the wrong target's memory reads as a firmware bug, so an error is cheaper than a guess.
+- **Credential-shaped values are withheld before they leave the machine.** Applied to variable reads and `evaluate_expression`. Numeric scalars and raw target reads (memory, core registers, peripherals, `-exec`) are never withheld, so firmware state stays fully readable.
+- **Local & credential-free.** The MCP server binds loopback only and rejects non-loopback `Host`/`Origin`; the per-window control server is loopback-bound and token-gated. Nothing leaves the machine.
 
 ## Installation
 
@@ -121,7 +137,7 @@ These are engineering invariants the agent can rely on — see [CHANGES-VS-UPSTR
 Download the latest `cmsis-debugmcp-<version>.vsix` from <https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases>, then:
 
 ```bash
-code --install-extension cmsis-debugmcp-1.0.27.vsix
+code --install-extension cmsis-debugmcp-<version>.vsix
 ```
 
 Reload the VS Code window after install. Copilot picks the server up automatically via the registered `McpServerDefinitionProvider` — no `mcp.json` edits required.
@@ -132,12 +148,14 @@ Reload the VS Code window after install. Copilot picks the server up automatical
 git clone https://github.com/MatthiasHertel80/CMSIS-DebugMCP.git
 cd CMSIS-DebugMCP
 npm install
-npm run compile
-npx --yes @vscode/vsce package
-code --install-extension cmsis-debugmcp-1.0.27.vsix
+npx --yes @vscode/vsce package --allow-star-activation
+code --install-extension cmsis-debugmcp-<version>.vsix --force
 ```
 
-The extension activates on startup and registers an MCP server on `http://localhost:3001/mcp` by default (falls back to an OS-assigned port if 3001 is busy — the dynamic discovery handles this for Copilot).
+`vsce package` runs `vscode:prepublish`, which type-checks and builds the
+esbuild bundle — you do not need a separate `npm run compile` first.
+
+The extension activates on startup. One VS Code window binds `http://localhost:3001/mcp` and routes tool calls to whichever window owns the target; the others run a loopback control server and register themselves. Copilot picks the endpoint up automatically via the `McpServerDefinitionProvider`. See [Networking and multiple windows](#networking-and-multiple-windows).
 
 ### Recommended companion extensions
 
@@ -274,8 +292,9 @@ Configure CMSIS-DebugMCP behavior in VSCode settings:
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `cmsis-debugmcp.serverPort` | `3001` | Preferred port for the MCP server. If busy, an OS-assigned port is used instead. |
+| `cmsis-debugmcp.serverPort` | `3001` | Port for the MCP server. One window binds it and routes to the others; there is no per-window fallback port. |
 | `cmsis-debugmcp.timeoutInSeconds` | `180` | Timeout for debugging operations |
+| `cmsis-debugmcp.redactSecrets` | `true` | Withhold variable/expression values that look like credentials. Numeric scalars and raw target reads (`read_memory`, registers, peripherals, `-exec`) are never withheld. |
 
 Changing `serverPort` requires a window reload; the extension will offer to do it for you.
 
@@ -283,9 +302,13 @@ Changing `serverPort` requires a window reload; the extension will offer to do i
 
 The MCP server binds **`127.0.0.1` only** and rejects requests whose `Host`/`Origin` is not a loopback address. It has no authentication and can flash, erase, and read the memory of attached hardware, so it must never be exposed to a network. VS Code Remote SSH / WSL / Codespaces forward localhost, so those setups work unchanged.
 
-Each VS Code window runs its own server. The first window to activate takes `serverPort`; later windows fall back to an OS-assigned port, so a window never shares another window's debug session. In-editor agents (Copilot) discover the right port automatically via the registered `McpServerDefinitionProvider`.
+**Several windows are supported, and route correctly.** One window binds `serverPort` and becomes the *router*; every other window runs a token-gated loopback control server and publishes itself to a shared registry. The router forwards each tool call to the window that owns the target, so external CLI agents (Claude Code, Codex, Copilot CLI) — which read a single global config naming one URL — reach every window through it. In-editor Copilot points at the same endpoint, so both agree on which window owns the board. Closing the router promotes another window within ~10s.
 
-External CLI agents (Claude Code, Codex, Copilot CLI) read a single global config file, which can only name one URL — the most recently activated window wins. If you drive hardware from a CLI agent, keep one CMSIS-DebugMCP window open, or re-run **CMSIS-DebugMCP: Show Agent Selection Popup** from the window you want the agent to attach to.
+The router picks the target from a file path when the tool has one (`add_breakpoint`, `start_debugging`). Most tools here have none — `read_memory`, `cmsis_action`, `flash`, `reset`, the serial tools — so it falls back to the window with an active debug session, which is the usual one-window-one-board case.
+
+When **two windows are debugging at once** it refuses to guess and names both. Reading the wrong board's memory looks exactly like a firmware bug, so an error is cheaper. Use `list_debug_windows` and `select_debug_window` to pin one for the session.
+
+> Before v2.0.0 each window ran its own server on a fallback port and the last window to start overwrote the shared agent config — which is precisely how an agent ended up driving a window that did not hold the board.
 
 
 ## FAQ
@@ -319,7 +342,9 @@ No. CMSIS-DebugMCP runs 100% locally. The MCP server runs on `localhost`, and no
 <details>
 <summary><b>What if port 3001 is already in use?</b></summary>
 
-Change the port in VS Code settings: `"cmsis-debugmcp.serverPort": 3002` (or any available port). Then update your AI assistant's MCP configuration to use the new port.
+If it is held by **another CMSIS-DebugMCP window**, that is normal and nothing is wrong: one window is the router and serves every window, including this one. The extension log will say `this window is a worker`.
+
+If it is held by an unrelated process, change the port in VS Code settings: `"cmsis-debugmcp.serverPort": 3002` (or any free port), reload, and update your AI assistant's MCP configuration to match. Set it in **User** settings so every window agrees — windows configured with different ports cannot see each other and each becomes its own isolated router.
 </details>
 
 <details>
@@ -358,18 +383,36 @@ Make sure CMSIS-DebugMCP is registered in your AI assistant's MCP settings. The 
 ### Architecture
 
 ```
-AI Agent ──MCP/HTTP──► CMSIS-DebugMCP (VS Code extension)
-                         │
-                         ├── vscode.debug.* ─► CDT GDB Debug Adapter (gdbtarget)
-                         │                       │
-                         │                   arm-none-eabi-gdb (GDB MI)
-                         │                       │
-                         │                   pyOCD / J-Link GDB Server
-                         │                       │
-                         │                   SWD/JTAG ─► Cortex-M target
-                         │
-                         └── Peripheral Inspector API / SVD parser → register decode
+AI Agent ──MCP/HTTP──► :3001  VS Code window A  (router)
+                                │
+                                ├── runs the tool here, or forwards it ──┐
+                                │                                        │
+                                │                          127.0.0.1 + token
+                                │                                        ▼
+                                │                          VS Code window B  (worker)
+                                │                                        │
+                                ▼                                        ▼
+                         ┌──────────────────────────────────────────────────┐
+                         │ per window:                                      │
+                         │  ├── vscode.debug.* ─► CDT GDB Debug Adapter     │
+                         │  │                       (gdbtarget)             │
+                         │  │                          │                    │
+                         │  │                   arm-none-eabi-gdb (GDB MI)  │
+                         │  │                          │                    │
+                         │  │                   pyOCD / J-Link GDB Server   │
+                         │  │                          │                    │
+                         │  │                   SWD/JTAG ─► Cortex-M target │
+                         │  │                                               │
+                         │  └── Peripheral Inspector API / SVD parser       │
+                         │            → register decode                     │
+                         └──────────────────────────────────────────────────┘
 ```
+
+Exactly one window binds the MCP port, so an agent has a single stable URL. Which
+window a call runs in is decided per call: from a file path when the tool has
+one, otherwise from the window holding an active debug session. Every window
+publishes itself — workspace folders, whether it is debugging, its CMSIS
+solution — to a shared registry under the OS temp directory.
 
 ### Launch Configuration Integration
 The extension handles debug configurations intelligently:
@@ -395,12 +438,39 @@ The extension handles debug configurations intelligently:
 
 ## Development
 
-To build the extension:
-
 ```bash
 npm install
-npm run compile
+
+npm run compile        # tsc → out/  (what the tests run against)
+npm run check-types    # type-check only
+npm run package        # check-types + production esbuild bundle → dist/
+npm run lint           # one pre-existing eqeqeq warning in serialMonitorBridge.ts is expected
 ```
+
+The extension ships as the esbuild bundle in `dist/`; `out/` exists for the
+tests. See [docs/packaging-esbuild.md](docs/packaging-esbuild.md) for why
+`serialport` is deliberately left unbundled.
+
+### Tests
+
+```bash
+npm test                                              # VS Code integration tests
+npm run test:transport                                # session lifecycle + two-window routing, over real sockets
+node test/transport/packaged-vsix.js <built.vsix>     # verify a packaged VSIX
+```
+
+The unit tests can also be run headlessly against `out/`, which is useful where
+the Electron harness will not start:
+
+```bash
+./node_modules/.bin/mocha --ui tdd \
+  --require test/transport/vscode-stub.js out/test/*.test.js
+```
+
+`test/transport/packaged-vsix.js` is the one that catches packaging mistakes:
+a missing entry in the `.vscodeignore` serialport allow-list fails **only** in
+the built extension, never in the workspace, so it unpacks the VSIX and proves
+the native serial binding really enumerates ports.
 
 ## Contributing
 

@@ -4,7 +4,85 @@ All notable changes to CMSIS-DebugMCP will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.0.3] - 2026-08-10
+
+### Fixed
+- **2.0.2 could not activate at all: `Cannot find module './impl/format'`.** `jsonc-parser`'s default entry is a UMD bundle that hands `require` to its factory as a parameter, so esbuild cannot trace `require("./impl/format")` and left the call in the bundle; at runtime it resolved relative to `dist/`, where `impl/` does not exist. esbuild now aliases the package to its ESM build, which uses ordinary static imports.
+- **The packaged-VSIX harness never loaded the bundle**, which is how a completely dead extension passed every check and shipped. It now requires the entry point and asserts `activate`/`deactivate` are exported. Verified the check catches the original failure by rebuilding without the alias.
+
+## [2.0.2] - 2026-08-10
+
+### Fixed
+- **The bundled agent skill is now actually installed.** It shipped inside the VSIX but was only copied to `~/.agents/skills/` from `configureAgent()` — the agent-registration dialog. Anyone who registered their agents in an earlier release never opens that dialog again, so upgrading delivered the skill to nobody. It is agent-independent by design, so it now installs on activation and overwrites, keeping it in step with the installed extension version instead of drifting behind it.
+
+## [2.0.1] - 2026-08-10
+
+### Changed
+- **The extension is bundled with esbuild.** Ships one `dist/extension.js` plus `serialport`'s subtree instead of the whole production dependency tree: **2271 files / 14.7 MB → 246 files / 12.4 MB**. `serialport` stays external because `node-gyp-build` resolves its native `.node` relative to `__dirname` at runtime, so bundling it would break every serial tool. `test/transport/packaged-vsix.js` unpacks a built VSIX and checks the native binding really enumerates ports — that failure mode exists only in the packaged extension, never in development.
+
+### Fixed
+- **Compiled tests are no longer packaged.** `.vscodeignore` excluded `src/**` and `test/**` but not `out/test/**`, so every release up to 1.2.1 shipped compiled tests unnoticed. It surfaced when `vsce` refused to package 2.0.0: the redaction tests carry credential-shaped fixtures to prove those shapes get withheld, and the secret scanner found them in the VSIX.
+
+## [2.0.0] - 2026-08-10
+
+Upstream sync: the fork was based on `microsoft/DebugMCP` `4422d8c` (2026-03-14) and had cherry-picked three commits since. Upstream is 102 commits ahead at v2.3.0. This release takes what applies to Cortex-M, adapts what does not, and says which is which.
+
+It also carries the hardware-tool work that had accumulated unreleased on `feature/hw-tools-reset-wait-flash-dwt`.
+
+**Major, not minor.** Three things change behaviour an existing setup can depend on:
+
+- **A window no longer always runs its own MCP server.** One window binds `serverPort` and routes to the rest; the OS-assigned fallback port is gone. Anything that discovered a per-window port, or assumed "my window = my server", has to change. This is the fix for agents driving the wrong board, so the old behaviour is not coming back.
+- **The MCP transport is stateful.** Clients must carry the `mcp-session-id` from `initialize`. Every SDK client does; a hand-rolled client that POSTed bare JSON-RPC will now get a 400.
+- **`add_breakpoint` prefers `line` over `lineContent`.** `lineContent` still works and is not going away this release, but it is deprecated and the response says so.
+
+It also matches upstream's 2.x line, which this release syncs against.
+
+### Added — hardware tools
+- **`wait_for_stop` tool** — block until the target next stops (breakpoint, fault, step-complete, pause) and return the stop reason plus the current debug state, or a structured timeout. Built on raw DAP `stopped` events from the session tracker (the ground truth), not VS Code UI events. Returns immediately with the recorded reason when the target is already stopped. This replaces sleeping blind after `continue_execution` returned while the target was still running — the pattern that once missed a 15 s playback window.
+- **`reset` tool** — reset the target inside the live session (breakpoints and session survive, unlike `restart_debugging`) via GDB monitor commands, and **verify the reset actually took effect**: after the reset-halt the PC must equal the reset handler read from the vector table (VTOR-based, falling back to table base 0). `method: auto` escalates `system` → `core` → `hardware` until one verifies; adapter replies that read like "unknown command" escalate instead of being trusted. Unverified resets are reported honestly ("target does NOT appear to have reset", with the adapter replies and the nSRST wiring caveat) — silent non-resets on attach configurations were a recurring field issue.
+- **`read_cycle_counter` tool** — DWT CYCCNT for cycle-accurate timing: enables `DEMCR.TRCENA` and `DWT_CTRL.CYCCNTENA` when needed, reports `NOCYCCNT` cores honestly, and prints the wrap (~10.7 s @ 400 MHz), core-halt, and WFE-sleep caveats with the two-point delta recipe.
+- **`flash` tool** — `pyocd load --cbuild-run <file>` as a synchronous operation: bytes programmed + rate on success, exit code + pyOCD error/output tail on failure. The cbuild-run file is auto-resolved from launch.json's `cmsis.cbuildRunFile` or a recursive `out/` scan; ambiguity is an error naming the candidates, never a silent pick. Refuses while a debug session is active (programming under a live session wedges most probes). Requires pyocd on PATH; `cmsis_action load` remains the bundled-pipeline alternative.
+- **Launch-failure diagnostics passthrough.** The session tracker now keeps a bounded per-session ring of recent adapter traffic (failed DAP responses, adapter stderr/console output — `stdout` excluded so target printf can't flush real errors out). `start_debugging` failures and the `cmsis_action load_and_debug` / `attach` "did NOT survive the initial connect" report append it, instead of leaving the real cause in the extension-host log.
+
+### Fixed — hardware tools
+- **`read_peripheral_register` decoded full-word SVD fields as 0.** `decodeFields()` built its mask as `((1 << width) - 1) << bitLow`, but JS bitwise ops coerce to int32: `1 << 32` wraps to 1, so any `[31:0]` field got mask 0 and silently decoded to `0x0` for every register value; width-31 fields were corrupted by the negative `(1 << 31) - 1`, and fields touching bit 31 could print negative. The decode now shifts first (`>>>` is ToUint32) and masks with `2**width - 1` (exact for width ≤ 31), so no intermediate is ever a negative int32. Covered by new unit tests (widths 1/8/31/32, high-bit fields, negative-input normalization).
+- **Parsed-SVD cache is now invalidated when a debug session ends.** `clearSvdCache()` existed but had no callers, so a session against a different device could have kept the previous device's decode.
+- **Memory writes are verified.** New `writeMemoryWord` executor primitive (DAP `writeMemory` with GDB-`set` fallback) always reads the word back and throws "did not stick" on mismatch — a silently dropped write is exactly how "reset did nothing" happens in the field. Shared by `reset` and `read_cycle_counter`.
+
+### Added — upstream sync
+- **`add_logpoint` tool** — print a message and resume instead of halting, bound GDB-native via `dprintf`. Expressions interpolate as `{expr}`; GDB infers nothing about types, so `{expr}` defaults to `%d` and `{expr:%s}` / `{expr:%f}` / `{expr:%p}` override it, with `{{`/`}}` for literal braces. `dprintf` takes no inline `if`, so a `condition` is attached afterwards by breakpoint number — and the response says plainly when the adapter echoed no number to attach it to, rather than pretending the condition applied. The tool description does not claim logpoints are free here: the core still halts on every hit to format and print, which in an ISR or a hot loop distorts the timing you are usually measuring.
+- **Conditional breakpoints** — `add_breakpoint` accepts `condition`, passed to GDB as its native `if` clause so the CPU is only halted when it holds. A VS Code-side condition would still stop the core on every hit and decide afterwards. Conditions, log messages, hit counts and disabled state are surfaced in `list_breakpoints` and the debug state as `file:line [when: ...]`.
+- **`list_variable_names` tool** — names and types of everything in scope, reading no values. On a slow probe or a large frame that turns thirty round trips into one.
+- **`variableNames` filter** on `get_variables_values` and `get_frame_variables` — read only what you asked for. Names are matched against the DAP `evaluateName` first and then the display name, with an adapter type decoration (`config [Dictionary]`) stripped from both; matching the raw display name alone leaves those variables unreachable. Requested names that match nothing are reported back rather than silently omitted. **Deliberately optional, unlike upstream**, which made it required in 2.3.0 — embedded frames are small, so the full dump is usually what you want, and making it mandatory would break every existing agent prompt for no gain.
+- **Secret redaction** (`cmsis-debugmcp.redactSecrets`, default on) — values whose name or content looks like a credential are withheld before leaving the extension, on the variable views and `evaluate_expression`. Two fork-specific carve-outs, because the upstream name-only policy misfires badly on firmware: **numeric scalars are never withheld** whatever the variable is called (a `uint8_t auth`, a `token` counter and `0xDEADBEEF` all stay readable — a 32-bit integer cannot carry a credential), and **raw target reads bypass redaction entirely** (`read_memory`, `read_core_registers`, `read_peripheral_register`, `get_fault_info`, and `-exec` GDB passthrough). Real SVDs name registers `KEY`, `KR`, `KEYR` and `UNLOCK` — the watchdog and flash unlock registers — and those are exactly what you need when the watchdog is resetting you. Strings, buffers and structures still get the full treatment.
+- **Multi-window routing.** External agents get exactly one MCP URL, and until now every window ran its own server on whatever port it could get while `agentConfigurationManager` wrote whichever port that window received — so the last window to start won and the agent routinely drove a window that did not hold the board. Now one window binds the well-known port and forwards each call to the window that owns the target, over a token-gated loopback control server, using a shared file registry of live windows. Upstream routes on a file path alone, which suffices there because every one of its tools takes one; only four do here, so the resolution ladder continues past the path: an explicit pin, the session's established target, the sole window with an active debug session (the normal one-window-one-board case), then the sole window. Ties resolve to an error naming every candidate rather than a guess — reading the wrong board's memory reads as a firmware bug and costs far more than being asked to pick.
+- **`list_debug_windows` and `select_debug_window` tools** — see the candidate windows and pin one for the session. Registered only when the server is actually routing.
+- **Roo Code and Antigravity** added to the agent registration roster, and the selection popup is suppressed under Antigravity/Gemini, which configure MCP servers themselves.
+- **`cmsis-debug-live` Agent Skill**, installed to `~/.agents/skills/` (and `~/.copilot/skills/` when present) on agent registration. Written for Cortex-M rather than adapted from upstream's host-process `debug-live`: target awareness from the CMSIS YAMLs, the five-state session gate, the FPB budget, what to do when a variable and the peripheral disagree, fault decode, and the routing tools. Named `cmsis-debug-live` so it cannot collide with upstream's skill when both extensions are installed.
+
+### Changed — upstream sync
+- **`add_breakpoint` takes a 1-based `line`.** It previously took a `lineContent` substring and set a breakpoint on *every* line containing it — in C routinely dozens (`}`, `return;`, `break;`), quietly exhausting the FPB comparators. `lineContent` remains as a deprecated optional fallback so existing agent prompts keep working, and the response says when it was used and how many lines matched.
+- **MCP transport is per-session rather than per-request.** `initialize` mints an `mcp-session-id` and that session's transport serves its POSTs, its `GET` SSE stream and its `DELETE`. This is not a return to the shared-server bug that hung `get_threads` after three calls — that was one `McpServer` being closed and reconnected per request; a session-scoped server is never closed mid-flight, and `test/transport/session-lifecycle.js` asserts exactly that.
+- **The MCP server no longer falls back to an OS-assigned port.** That fallback is what produced the misrouting. Losing the bind now means another window is the router, and this window becomes a worker; workers retry every 10s so closing the router promotes a survivor rather than leaving the agents' URL dead. Every window advertises the router's endpoint, including through the `McpServerDefinitionProvider`, so in-window Copilot routes exactly like an external agent.
+- `deactivate()` is awaited, so a window leaves the shared registry before its extension host goes away.
+
+### Fixed — upstream sync
+- **The reported current line was read from the active text editor.** VS Code moves the editor cursor asynchronously after a stop and only for the focused editor, so the position lagged the actual stop and was simply wrong whenever focus was elsewhere — and on a `gdbtarget` session the editor may not track the target at all. It now comes from the DAP top stack frame, which is ground truth. This also removed the 300 ms settle sleep that existed only to let the cursor catch up. (Upstream PR #96.)
+- **`GET /mcp` returned a bare 404.** Only `POST` was registered, so the server→client SSE stream a client opens right after `initialize` failed. Cursor's MCP client treats that as a fatal transport error and tombstones the connection as "errored" even while POST tool calls keep working. `GET` and `DELETE` are now registered at startup. (Upstream PR #96.)
+
+### Internal
+- Removed `waitForStateChange`/`hasStateChanged`, the old 1 s blind-poll loop, dead since stepping moved to the event-driven wait.
+- Op dispatch across windows goes through one shared table checked against `IDebuggingHandler` and `SerialHandler` **at compile time**, so adding a tool without making it routable fails the build. Upstream hand-writes two switches; with 31 debug ops and 11 serial ops here, duplicating the list would guarantee drift, and an op that fell out would run in the router window against the wrong board.
+- `test/transport/` — two harnesses that drive the real server over a real socket outside the extension host: the Streamable-HTTP session lifecycle (including the three-consecutive-`get_threads` regression gate) and two-window election, publication, pinning and router failover.
+- 132 unit tests, up from 6.
+
+### Not taken from upstream
+- **The breaking `get_variables_values`** (required `variableNames`) — added as an optional filter instead.
+- **`src/utils/withTimeout.ts`** — the fork's `src/utils/timeout.ts` is a superset (`customRequestWithTimeout`, `HardwareTimeoutError`).
+- **`debugTestAtCursor` / VS Code Testing API test debugging** — no meaning for `gdbtarget` firmware.
+- **Upstream's `debugConfigurationManager` refactor** — theirs went toward .NET/csproj auto-configuration; the fork's is CMSIS-specific and keeps `jsonc-parser`, which upstream dropped.
+- **Removal of `get_debug_instructions`** — kept. Copilot Chat reads MCP tools but not `~/.agents/skills`, so removing it would leave that harness with nothing.
+- **esbuild bundling** — prepared but **not enabled**; `esbuild` could not be installed in the environment where this was done, so the bundle was never built and the serial backend was never checked against a packaged VSIX. See [docs/packaging-esbuild.md](docs/packaging-esbuild.md).
 
 ## [1.2.1] - 2026-07-11
 

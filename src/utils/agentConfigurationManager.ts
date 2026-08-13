@@ -90,6 +90,18 @@ function isCodexDebugMCPSectionHeader(line: string): boolean {
     return /^\s*\[mcp_servers\.cmsis-debugmcp\]\s*(?:#.*)?$/.test(line);
 }
 
+/**
+ * Directory name of the bundled Agent Skill, under `skills/` in the extension
+ * and under the personal skills directories once installed.
+ *
+ * Not upstream's `debug-live`: both extensions can be installed at once, and
+ * they would otherwise fight over the same directory — leaving whichever
+ * registered last in place, with a workflow written for the wrong kind of
+ * target. For the same reason no legacy-name cleanup is done here; removing a
+ * `debug-live` directory would delete upstream's skill.
+ */
+const SKILL_NAME = 'cmsis-debug-live';
+
 export class AgentConfigurationManager {
     private context: vscode.ExtensionContext;
     // Versioned so the popup re-appears once when new agents are added to
@@ -106,8 +118,14 @@ export class AgentConfigurationManager {
     }
 
     /**
-     * Update the server port (e.g. after the OS assigned a free port).
-     * Call this before writing any agent configurations.
+     * Set the port written into agent configurations.
+     *
+     * Always the well-known router port, in every window. It used to be
+     * whichever port this window's own server managed to bind, so the last
+     * window to start overwrote the shared agent config and pointed the agent
+     * at an arbitrary window. Now one window serves that port and forwards
+     * each call to the window that owns the target, so every window writing
+     * the same value is correct and idempotent.
      */
     public updatePort(port: number): void {
         this.serverPort = port;
@@ -117,6 +135,12 @@ export class AgentConfigurationManager {
      * Check if we should show the post-install popup
      */
     public async shouldShowPopup(): Promise<boolean> {
+        // Antigravity / Gemini configure MCP servers themselves, so the
+        // selection popup is noise there — it offers a choice the host has
+        // already made.
+        if (process.env.ANTIGRAVITY_ENV === 'true' || process.env.GEMINI_HOME) {
+            return false;
+        }
         // Check if popup has already been shown
         const popupShown = this.context.globalState.get<boolean>(this.POPUP_SHOWN_KEY, false);
         return !popupShown;
@@ -224,6 +248,22 @@ export class AgentConfigurationManager {
         console.log(`Detected platform: ${platform}, using config base path: ${configBasePath}`);
 
         const agents: AgentInfo[] = [
+            {
+                id: 'roo',
+                name: 'roo',
+                displayName: 'Roo Code',
+                configPath: path.join(configBasePath, 'Code', 'User', 'globalStorage', 'rooveterinaryinc.roo-cline', 'settings', 'mcp_settings.json'),
+                configFormat: 'json',
+                mcpServerFieldName: 'mcpServers'
+            },
+            {
+                id: 'antigravity',
+                name: 'antigravity',
+                displayName: 'Antigravity',
+                configPath: path.join(os.homedir(), '.gemini', 'antigravity', 'mcp_config.json'),
+                configFormat: 'json',
+                mcpServerFieldName: 'mcpServers'
+            },
             {
                 id: 'cline',
                 name: 'cline',
@@ -590,13 +630,21 @@ export class AgentConfigurationManager {
             const success = await this.addDebugMCPToAgent(agent);
 
             if (success) {
-                // Show success message with green pass icon and link to open config file
+                // The skill is agent-independent — one shared location per the
+                // Agent Skills standard — but registering an agent is the point
+                // at which the user has said they want to use this, so it is
+                // also the right moment to put the skill where that agent will
+                // find it. Best-effort: a skill that fails to install must not
+                // fail the registration.
+                const skillPath = await this.installCmsisDebugSkill();
+
                 const openConfigButton = 'Open Config';
                 const result = await vscode.window.showInformationMessage(
-                    `✅ CMSIS-DebugMCP successfully configured for ${agent.displayName}`,
+                    `✅ CMSIS-DebugMCP successfully configured for ${agent.displayName}` +
+                    (skillPath ? ' (skill /cmsis-debug-live installed)' : ''),
                     openConfigButton
                 );
-                
+
                 if (result === openConfigButton) {
                     // Open the config file in VSCode
                     const configUri = vscode.Uri.file(agent.configPath);
@@ -607,5 +655,69 @@ export class AgentConfigurationManager {
             console.error(`Error configuring ${agent.name}:`, error);
             vscode.window.showErrorMessage(`Failed to configure ${agent.displayName}: ${error}`);
         }
+    }
+
+    /**
+     * Where the bundled skill gets installed, per the Agent Skills open
+     * standard (agentskills.io). `~/.agents/skills/` is the cross-agent
+     * location skills-compatible harnesses honour; `~/.copilot/skills/` is
+     * added when a Copilot home exists.
+     */
+    private getSkillInstallTargets(): string[] {
+        const home = os.homedir();
+        const targets = [path.join(home, '.agents', 'skills', SKILL_NAME)];
+        const copilotHome = process.env.COPILOT_HOME || path.join(home, '.copilot');
+        if (fs.existsSync(copilotHome)) {
+            targets.push(path.join(copilotHome, 'skills', SKILL_NAME));
+        }
+        return targets;
+    }
+
+    /** The skill directory shipped inside the extension. */
+    private getBundledSkillPath(): string {
+        return path.join(this.context.extensionPath, 'skills', SKILL_NAME);
+    }
+
+    /**
+     * Copy the bundled skill into the standard personal skills directories.
+     *
+     * Called on every activation, not just on agent registration. The skill is
+     * agent-independent — it lives in one shared location per the Agent Skills
+     * standard — so gating it on "the user picked an agent from the popup"
+     * meant an existing user upgrading the extension never received it: they
+     * already registered their agents releases ago and never open that dialog
+     * again.
+     *
+     * Overwrites unconditionally so the skill tracks the installed extension
+     * version rather than drifting behind it. It is five files, ~24 KB.
+     *
+     * Returns the primary destination, or null when nothing was installed.
+     * Every failure is logged and skipped: not being able to write a skill file
+     * must never take activation (or an agent registration) down with it.
+     */
+    public async installCmsisDebugSkill(): Promise<string | null> {
+        const bundledSkillPath = this.getBundledSkillPath();
+
+        if (!fs.existsSync(bundledSkillPath)) {
+            console.warn(`Bundled skill not found at ${bundledSkillPath}; skipping skill install`);
+            return null;
+        }
+
+        let primaryDestination: string | null = null;
+        for (const destination of this.getSkillInstallTargets()) {
+            const skillsDir = path.dirname(destination);
+            try {
+                await fs.promises.mkdir(skillsDir, { recursive: true });
+                await fs.promises.cp(bundledSkillPath, destination, { recursive: true, force: true });
+                console.log(`Installed ${SKILL_NAME} skill at ${destination}`);
+                if (!primaryDestination) {
+                    primaryDestination = destination;
+                }
+            } catch (error) {
+                console.warn(`Failed to install ${SKILL_NAME} skill at ${destination}:`, error);
+            }
+        }
+
+        return primaryDestination;
     }
 }

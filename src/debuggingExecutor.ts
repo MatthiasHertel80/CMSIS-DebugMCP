@@ -1,12 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 
 import * as vscode from 'vscode';
-import { DebugState, StackFrame } from './debugState';
+import { DebugState, StackFrame, formatBreakpointModifiers } from './debugState';
 import { customRequestWithTimeout, HardwareTimeoutError, withTimeout } from './utils/timeout';
 import {
     isSessionStopped, getStoppedReason, resolveActiveSession,
     getLiveSessionCount, getLiveSessionNames,
+    waitForStopEvent, StopWaitResult,
 } from './utils/sessionStateTracker';
+import {
+    buildResetCommands, detectGdbServerKind, replyLooksUnsupported,
+    GdbServerKind, ResetMethod,
+} from './core/resetAssist';
+import { DEMCR_TRCENA, DWT_ADDRESSES, DWT_CTRL_CYCCNTENA, DWT_CTRL_NOCYCCNT } from './core/dwt';
 import { logger } from './utils/logger';
 
 /**
@@ -48,10 +54,13 @@ export interface IDebuggingExecutor {
     stepOut(timeoutMs?: number): Promise<void>;
     continue(timeoutMs?: number): Promise<void>;
     pause(timeoutMs?: number): Promise<void>;
+    waitForStop(timeoutMs?: number): Promise<StopWaitResult | { kind: 'already-stopped'; reason: string | null }>;
     restart(): Promise<void>;
-    addBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
+    addBreakpoint(uri: vscode.Uri, line: number, options?: { condition?: string; logMessage?: string }): Promise<void>;
     removeBreakpoint(uri: vscode.Uri, line: number): Promise<void>;
-    setBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number): Promise<string>;
+    setBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number, condition?: string): Promise<string>;
+    setLogpointViaGdb(fileFullPath: string, line: number, format: string, args: string[], timeoutMs?: number): Promise<string>;
+    setBreakpointConditionViaGdb(breakpointNumber: number, condition: string, timeoutMs?: number): Promise<string>;
     clearBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number): Promise<string>;
     clearAllBreakpointsViaGdb(timeoutMs?: number): Promise<string>;
     getCurrentDebugState(numNextLines: number): Promise<DebugState>;
@@ -63,7 +72,10 @@ export interface IDebuggingExecutor {
     getActiveSession(): vscode.DebugSession | undefined;
     readMemory(address: string, length: number, timeoutMs?: number): Promise<Buffer>;
     readMemoryWord(address: string, timeoutMs?: number): Promise<number>;
+    writeMemoryWord(address: string, value: number, timeoutMs?: number): Promise<void>;
+    resetTarget(options: { method?: 'auto' | ResetMethod; halt?: boolean; timeoutMs?: number }): Promise<ResetOutcome>;
     readCoreRegisters(timeoutMs?: number): Promise<Record<string, string>>;
+    readCycleCounter(timeoutMs?: number): Promise<{ cycles: number; enabledNow: boolean; present: boolean }>;
     readPeripheralRegister(peripheral: string, register?: string, timeoutMs?: number): Promise<string>;
     getFaultInfo(timeoutMs?: number): Promise<string>;
     getDeviceInfo(): Promise<string>;
@@ -82,6 +94,24 @@ export interface DapThread {
     topFrame?: StackFrame;
 }
 
+/** Result of a verified target reset — see resetTarget(). */
+export interface ResetOutcome {
+    /** GDB server detected behind the session (drives the monitor-command dialect). */
+    serverKind: GdbServerKind;
+    /** Reset methods attempted, in order ('auto' escalates on failed verification). */
+    methodsTried: ResetMethod[];
+    /** Monitor commands sent, in order. */
+    commandsIssued: string[];
+    /** Raw adapter replies, one per issued command. */
+    replies: string[];
+    /** True only when PC was confirmed at the reset vector afterwards. */
+    verified: boolean;
+    /** Human-readable verification evidence (PC vs reset vector, or why it could not be checked). */
+    verificationDetail: string;
+    /** True when the target was running and we halted it to issue the reset. */
+    haltedByUs: boolean;
+}
+
 /** Low-level diagnostics for telling a stale build / wrong-window apart from a genuine no-session. */
 export interface ExecutorDiagnostics {
     serverVersion: string;
@@ -91,7 +121,7 @@ export interface ExecutorDiagnostics {
 }
 
 /** Bumped in lockstep with package.json — surfaced by getDiagnostics() so the agent can confirm which build answered. */
-export const SERVER_VERSION = '1.2.1';
+export const SERVER_VERSION = '2.0.3';
 
 /**
  * Coarse classification of the debug session, exposed to MCP clients so an
@@ -304,6 +334,22 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     }
 
     /**
+     * Block until the target next stops (breakpoint, fault, step-complete,
+     * pause) and report the stop reason, or until the timeout / session end.
+     * If the target is already stopped the agent's question is answered —
+     * return the recorded reason rather than waiting for a *future* event.
+     * Issues no execution commands itself.
+     */
+    public async waitForStop(timeoutMs?: number): Promise<StopWaitResult | { kind: 'already-stopped'; reason: string | null }> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+        if (isSessionStopped(session)) {
+            return { kind: 'already-stopped' as const, reason: getStoppedReason(session) };
+        }
+        return waitForStopEvent(session, capTimeout(timeoutMs, HARD_CALL_CAP_MS));
+    }
+
+    /**
      * Get the active thread ID from the current stack item or default to 1.
      */
     private getActiveThreadId(): number {
@@ -328,10 +374,18 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     /**
      * Add a breakpoint at specified location
      */
-    public async addBreakpoint(uri: vscode.Uri, line: number): Promise<void> {
+    public async addBreakpoint(
+        uri: vscode.Uri,
+        line: number,
+        options?: { condition?: string; logMessage?: string }
+    ): Promise<void> {
         try {
             const breakpoint = new vscode.SourceBreakpoint(
-                new vscode.Location(uri, new vscode.Position(line - 1, 0))
+                new vscode.Location(uri, new vscode.Position(line - 1, 0)),
+                true,
+                options?.condition,
+                undefined,
+                options?.logMessage,
             );
             vscode.debug.addBreakpoints([breakpoint]);
         } catch (error) {
@@ -387,9 +441,60 @@ export class DebuggingExecutor implements IDebuggingExecutor {
      * does and binds the breakpoint for real. Returns the raw GDB/adapter
      * text; the caller interprets it (a missing "Breakpoint N" echo is NOT a
      * failure — see execGdbCommand).
+     *
+     * A `condition` is appended as GDB's native `if <expr>` clause, so the CPU
+     * is only halted when it holds. That matters far more on a Cortex-M than in
+     * a host process: a VS Code-side condition would still stop the core on
+     * every hit and evaluate afterwards, wrecking timing in a hot loop.
      */
-    public async setBreakpointViaGdb(fileFullPath: string, line: number, timeoutMs?: number): Promise<string> {
-        const { raw } = await this.execGdbCommand(`break ${fileFullPath}:${line}`, timeoutMs);
+    public async setBreakpointViaGdb(
+        fileFullPath: string,
+        line: number,
+        timeoutMs?: number,
+        condition?: string,
+    ): Promise<string> {
+        const cond = condition?.trim() ? ` if ${condition.trim()}` : '';
+        const { raw } = await this.execGdbCommand(`break ${fileFullPath}:${line}${cond}`, timeoutMs);
+        return raw;
+    }
+
+    /**
+     * Bind a logpoint GDB-native via `-exec dprintf file:line,"fmt",args`.
+     *
+     * GDB's `dprintf` is the exact analogue of a VS Code logpoint: it prints
+     * and resumes rather than halting. The core is still halted momentarily per
+     * hit (nothing on a Cortex-M can print without stopping it), so this is not
+     * free — see the tool description.
+     *
+     * `format` must already be a printf format string and `args` the matching
+     * expression list; translation from the `{expr}` logpoint syntax happens in
+     * the handler, which is where the specifier rules are documented.
+     */
+    public async setLogpointViaGdb(
+        fileFullPath: string,
+        line: number,
+        format: string,
+        args: string[],
+        timeoutMs?: number,
+    ): Promise<string> {
+        const argList = args.length > 0 ? `,${args.join(',')}` : '';
+        const { raw } = await this.execGdbCommand(
+            `dprintf ${fileFullPath}:${line},"${format}"${argList}`,
+            timeoutMs,
+        );
+        return raw;
+    }
+
+    /**
+     * Attach a condition to an already-created GDB breakpoint by number.
+     * Used for conditional logpoints: `dprintf` takes no inline `if` clause.
+     */
+    public async setBreakpointConditionViaGdb(
+        breakpointNumber: number,
+        condition: string,
+        timeoutMs?: number,
+    ): Promise<string> {
+        const { raw } = await this.execGdbCommand(`condition ${breakpointNumber} ${condition}`, timeoutMs);
         return raw;
     }
 
@@ -445,36 +550,18 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 const activeStackItem = vscode.debug.activeStackItem;
                 if (activeStackItem && 'frameId' in activeStackItem) {
                     state.updateContext(activeStackItem.frameId, activeStackItem.threadId);
-                    
-                    // Extract frame name from stack frame
-                    await this.extractFrameName(activeSession, activeStackItem.frameId, state);
-                    
-                    // Get the active editor
-                    const activeEditor = vscode.window.activeTextEditor;
-                    if (activeEditor) {
-                        const fileName = activeEditor.document.fileName.split(/[/\\]/).pop() || '';
-                        const currentLine = activeEditor.selection.active.line + 1; // 1-based line number
-                        const currentLineContent = activeEditor.document.lineAt(activeEditor.selection.active.line).text.trim();
-                        
-                        // Get next non-empty lines
-                        const nextLines = [];
-                        let lineOffset = 1;
-                        while (nextLines.length < numNextLines && 
-                               activeEditor.selection.active.line + lineOffset < activeEditor.document.lineCount) {
-                            const lineText = activeEditor.document.lineAt(activeEditor.selection.active.line + lineOffset).text.trim();
-                            if (lineText.length > 0) {
-                                nextLines.push(lineText);
-                            }
-                            lineOffset++;
-                        }
-                        
-                        state.updateLocation(
-                            activeEditor.document.fileName,
-                            fileName,
-                            currentLine,
-                            currentLineContent,
-                            nextLines
-                        );
+
+                    // Take the current location from the debug adapter's top
+                    // stack frame rather than the active text editor. VS Code
+                    // moves the editor cursor asynchronously after a stop, and
+                    // only for the focused editor — reading it here lagged the
+                    // actual stop and reported the wrong file whenever focus was
+                    // elsewhere. On a gdbtarget session the editor may not track
+                    // the target at all. The DAP frame is ground truth.
+                    const topFrame = await this.extractFrameName(activeSession, activeStackItem.frameId, state);
+
+                    if (topFrame?.path && typeof topFrame.line === 'number') {
+                        await this.populateLocationFromFrame(state, topFrame.path, topFrame.line, numNextLines);
                     }
                 }
             }
@@ -489,7 +576,7 @@ export class DebuggingExecutor implements IDebuggingExecutor {
             .map(bp => {
                 const fileName = bp.location.uri.fsPath.split(/[/\\]/).pop() || 'unknown';
                 const line = bp.location.range.start.line + 1;
-                return `${fileName}:${line}`;
+                return `${fileName}:${line}${formatBreakpointModifiers(bp)}`;
             });
         state.updateBreakpoints(formattedBreakpoints);
 
@@ -497,9 +584,17 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     }
 
     /**
-     * Extract frame name and stack trace from the current debug session
+     * Extract frame name and stack trace from the current debug session.
+     *
+     * Returns the top frame's source location so the caller can report the
+     * authoritative current position without scraping the editor. Returns
+     * undefined when no stack frame is available.
      */
-    private async extractFrameName(session: vscode.DebugSession, frameId: number, state: DebugState): Promise<void> {
+    private async extractFrameName(
+        session: vscode.DebugSession,
+        frameId: number,
+        state: DebugState
+    ): Promise<{ path?: string; line?: number; column?: number } | undefined> {
         try {
             // Get full stack trace (up to 50 frames)
             const stackTraceResponse = await customRequestWithTimeout<any>(session, 'stackTrace', {
@@ -522,12 +617,59 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 }));
 
                 state.updateStackTrace(stackTrace);
+
+                // DAP line/column are 1-based (VS Code's default). Hand the raw
+                // top-frame location back for location reporting.
+                return {
+                    path: currentFrame.source?.path,
+                    line: currentFrame.line,
+                    column: currentFrame.column,
+                };
             }
         } catch (error) {
             console.log('Unable to extract stack info:', error);
             // Set empty values on error
             state.updateFrameName(null);
             state.updateStackTrace([]);
+        }
+        return undefined;
+    }
+
+    /**
+     * Populate the DebugState location (file, current line + content, and the
+     * next few non-empty lines) by reading the source document at the debugger's
+     * current frame line. Uses the DAP-reported path/line rather than the active
+     * editor, so it is accurate regardless of which editor (if any) has focus.
+     */
+    private async populateLocationFromFrame(
+        state: DebugState,
+        filePath: string,
+        line: number,
+        numNextLines: number
+    ): Promise<void> {
+        try {
+            const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(filePath));
+            const zeroBasedLine = Math.max(0, Math.min(line - 1, doc.lineCount - 1));
+            const fileName = filePath.split(/[/\\]/).pop() || '';
+            const currentLineContent = doc.lineAt(zeroBasedLine).text.trim();
+
+            // Collect the next non-empty lines for lookahead context.
+            const nextLines: string[] = [];
+            let lineOffset = 1;
+            while (nextLines.length < numNextLines && zeroBasedLine + lineOffset < doc.lineCount) {
+                const lineText = doc.lineAt(zeroBasedLine + lineOffset).text.trim();
+                if (lineText.length > 0) {
+                    nextLines.push(lineText);
+                }
+                lineOffset++;
+            }
+
+            state.updateLocation(filePath, fileName, line, currentLineContent, nextLines);
+        } catch (error) {
+            // Firmware stops in assembly, ROM, or a library the workspace has no
+            // source for — very common on Cortex-M. Degrade gracefully and leave
+            // the location unset rather than failing the whole state read.
+            console.log('Unable to read frame source document:', error);
         }
     }
 
@@ -956,6 +1098,178 @@ export class DebuggingExecutor implements IDebuggingExecutor {
     }
 
     /**
+     * Write a single 32-bit word to target memory (little-endian) and verify
+     * it stuck. DAP `writeMemory` first; falls back to GDB `set` via the REPL
+     * for adapters without it. The read-back is not optional — a silently
+     * dropped write is exactly how "reset did nothing" happens in the field.
+     * (Caveat: genuinely write-only registers would false-fail the read-back;
+     * AIRCR/DEMCR/DWT_CTRL — the registers this exists for — are all readable.)
+     */
+    public async writeMemoryWord(address: string, value: number, timeoutMs?: number): Promise<void> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+
+        const addr = address.startsWith('0x') || address.startsWith('0X') ? address : `0x${address}`;
+        const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
+
+        const buf = Buffer.alloc(4);
+        buf.writeUInt32LE(value >>> 0, 0);
+        try {
+            await customRequestWithTimeout<any>(session, 'writeMemory', {
+                memoryReference: addr,
+                data: buf.toString('base64'),
+            }, dapMs);
+        } catch (err) {
+            if (err instanceof HardwareTimeoutError) { throw err; }
+            await this.execGdbCommand(`set {unsigned int}${addr} = ${value >>> 0}`, dapMs);
+        }
+
+        const readBack = await this.readMemoryWord(addr, dapMs);
+        if ((readBack >>> 0) !== (value >>> 0)) {
+            throw new Error(
+                `Write to ${addr} did not stick (wrote 0x${(value >>> 0).toString(16).padStart(8, '0')}, ` +
+                `read back 0x${(readBack >>> 0).toString(16).padStart(8, '0')})`
+            );
+        }
+    }
+
+    /**
+     * Reset the target via GDB monitor commands and VERIFY the reset actually
+     * took effect. `restart_debugging` restarts the whole VS Code session;
+     * this resets the target inside the live session (breakpoints survive) —
+     * and reports honestly when the target did not appear to reset, because
+     * silent non-resets on attach configurations are a recurring field issue.
+     *
+     * Verification is PC-vs-reset-vector: after a halted reset the PC must
+     * equal the reset handler read from the vector table (VTOR-based, falling
+     * back to table base 0). 'auto' escalates system → core → hardware until
+     * one verifies. With halt=false the target is verified halted first, then
+     * resumed — the verification needs a stopped snapshot.
+     */
+    public async resetTarget(options: { method?: 'auto' | ResetMethod; halt?: boolean; timeoutMs?: number }): Promise<ResetOutcome> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+        const leaveHalted = options.halt !== false; // default true
+        const dapMs = capTimeout(options.timeoutMs, this.timeouts.dapRequestMs);
+
+        const config = session.configuration ?? {};
+        const outcome: ResetOutcome = {
+            serverKind: detectGdbServerKind(`${config.target?.server ?? ''} ${config.debugger?.name ?? ''} ${session.name}`),
+            methodsTried: [],
+            commandsIssued: [],
+            replies: [],
+            verified: false,
+            verificationDetail: 'not attempted',
+            haltedByUs: false,
+        };
+
+        // A reset must be issued from a halted state — halt a running target first.
+        if (!isSessionStopped(session)) {
+            await this.pause(dapMs);
+            const stop = await waitForStopEvent(session, 5_000);
+            if (stop.kind !== 'stopped') {
+                outcome.verificationDetail = 'could not halt the target to issue the reset (pause did not stop it within 5 s)';
+                return outcome;
+            }
+            outcome.haltedByUs = true;
+        }
+
+        const methods: ResetMethod[] = (!options.method || options.method === 'auto')
+            ? ['system', 'core', 'hardware']
+            : [options.method];
+
+        for (const method of methods) {
+            outcome.methodsTried.push(method);
+            // Always issue the halting form — the verification needs a stopped
+            // snapshot; a 'run'-mode reset would race the PC read. The target
+            // is resumed at the end when the caller asked for halt=false.
+            const commands = buildResetCommands(outcome.serverKind, method, true);
+            let unsupported = false;
+            for (const cmd of commands) {
+                outcome.commandsIssued.push(cmd);
+                const reply = await this.execGdbCommand(cmd, dapMs);
+                outcome.replies.push(reply.raw || '<no echo from adapter>');
+                if (replyLooksUnsupported(reply.raw)) { unsupported = true; }
+            }
+            if (unsupported) {
+                outcome.verificationDetail = `adapter did not recognize the ${method} reset command — trying the next method`;
+                continue;
+            }
+
+            // Most adapters emit a stopped event when the reset-halt lands;
+            // some don't. Wait briefly, then settle either way.
+            const stop = await waitForStopEvent(session, 3_000);
+            if (stop.kind === 'ended') {
+                outcome.verificationDetail = 'debug session ended during the reset';
+                return outcome;
+            }
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            const verification = await this.verifyResetViaVectorTable(dapMs);
+            outcome.verificationDetail = verification.detail;
+            if (verification.verified) {
+                outcome.verified = true;
+                break;
+            }
+        }
+
+        if (outcome.verified && !leaveHalted) {
+            await this.continue(dapMs);
+        }
+        return outcome;
+    }
+
+    /**
+     * Compare the live PC against the reset handler read from the vector
+     * table. The table base comes from VTOR (0xE000ED08, TBLOFF is bits 31:7)
+     * with a fallback to base 0 when VTOR reads as 0 or fails. All address
+     * math stays unsigned (>>> 0) — vector tables at 0x80000000+ are common
+     * (e.g. MRAM-aliased parts) and would go negative under int32 coercion.
+     */
+    private async verifyResetViaVectorTable(dapMs: number): Promise<{ verified: boolean; detail: string }> {
+        const hex = (n: number) => `0x${(n >>> 0).toString(16).padStart(8, '0')}`;
+        try {
+            let vectorBase = 0;
+            try {
+                const vtor = await this.readMemoryWord('0xE000ED08', dapMs);
+                if (vtor !== 0) { vectorBase = (vtor & 0xFFFFFF80) >>> 0; }
+            } catch {
+                // Fall back to table base 0 — pre-VTOR boot state or unreadable SCS.
+            }
+            const resetVector = ((await this.readMemoryWord(hex(vectorBase + 4), dapMs)) & 0xFFFFFFFE) >>> 0;
+            const pc = (await this.readProgramCounter(dapMs) & 0xFFFFFFFE) >>> 0;
+            const verified = pc === resetVector;
+            return {
+                verified,
+                detail: verified
+                    ? `PC=${hex(pc)} matches the reset vector (${hex(resetVector)}, vector table at ${hex(vectorBase)})`
+                    : `PC=${hex(pc)} does NOT match the reset vector ${hex(resetVector)} (vector table at ${hex(vectorBase)})`,
+            };
+        } catch (err) {
+            return { verified: false, detail: `verification reads failed: ${err instanceof Error ? err.message : String(err)}` };
+        }
+    }
+
+    /**
+     * Read the program counter via `$pc` evaluate, tolerating a symbol
+     * annotation in the reply ("0x080001a0 <Reset_Handler+4>").
+     */
+    private async readProgramCounter(dapMs: number): Promise<number> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+        const debugState = await this.getCurrentDebugState(0);
+        const frameOpt = debugState.frameId !== null ? { frameId: debugState.frameId } : {};
+        const response = await customRequestWithTimeout<any>(session, 'evaluate', {
+            expression: '$pc',
+            context: 'watch',
+            ...frameOpt,
+        }, dapMs);
+        const match = String(response?.result ?? '').match(/0x[0-9a-fA-F]+/);
+        if (!match) { throw new Error(`could not parse PC from '${response?.result ?? '<empty>'}'`); }
+        return parseInt(match[0], 16);
+    }
+
+    /**
      * Read Cortex-M core registers (R0-R15, xPSR, MSP, PSP, CONTROL, FAULTMASK, BASEPRI, PRIMASK).
      */
     public async readCoreRegisters(timeoutMs?: number): Promise<Record<string, string>> {
@@ -995,6 +1309,39 @@ export class DebuggingExecutor implements IDebuggingExecutor {
                 }
             }));
             return Object.fromEntries(entries);
+        });
+    }
+
+    /**
+     * Read the DWT cycle counter (CYCCNT), enabling trace + the counter when
+     * needed. Returns `present: false` on cores without a cycle counter
+     * (DWT_CTRL.NOCYCCNT). `enabledNow` tells the caller the counter was
+     * started by this call, so earlier deltas are not available. Note the
+     * counter stops while the core is halted AND during WFE sleep — it
+     * counts active cycles only — and wraps every 2^32 cycles.
+     */
+    public async readCycleCounter(timeoutMs?: number): Promise<{ cycles: number; enabledNow: boolean; present: boolean }> {
+        const session = resolveActiveSession();
+        if (!session) { throw new Error('No active debug session'); }
+        const overallMs = capTimeout(timeoutMs, this.timeouts.memoryReadMs);
+        const dapMs = capTimeout(timeoutMs, this.timeouts.dapRequestMs);
+        return withTimeout('readCycleCounter', overallMs, async () => {
+            // DEMCR.TRCENA gates the whole DWT unit — enable it if it is off.
+            const demcr = await this.readMemoryWord(DWT_ADDRESSES.DEMCR, dapMs);
+            if (!(demcr & DEMCR_TRCENA)) {
+                await this.writeMemoryWord(DWT_ADDRESSES.DEMCR, (demcr | DEMCR_TRCENA) >>> 0, dapMs);
+            }
+            const ctrl = await this.readMemoryWord(DWT_ADDRESSES.DWT_CTRL, dapMs);
+            if (ctrl & DWT_CTRL_NOCYCCNT) {
+                return { present: false, cycles: 0, enabledNow: false };
+            }
+            let enabledNow = false;
+            if (!(ctrl & DWT_CTRL_CYCCNTENA)) {
+                await this.writeMemoryWord(DWT_ADDRESSES.DWT_CTRL, (ctrl | DWT_CTRL_CYCCNTENA) >>> 0, dapMs);
+                enabledNow = true;
+            }
+            const cycles = (await this.readMemoryWord(DWT_ADDRESSES.DWT_CYCCNT, dapMs)) >>> 0;
+            return { present: true, cycles, enabledNow };
         });
     }
 
