@@ -7,8 +7,8 @@ Works with **GitHub Copilot**, **Claude Code**, **Claude Desktop**, **Cline**, *
 > This project is a fork of [microsoft/DebugMCP](https://github.com/microsoft/DebugMCP) extended for Arm embedded workflows. See [CHANGELOG.md](CHANGELOG.md) for the list of embedded-specific additions.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![VS Code](https://img.shields.io/badge/VS%20Code-1.104.0+-blue.svg)](https://code.visualstudio.com/)
-[![Version](https://img.shields.io/badge/version-2.0.3-green.svg)](https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases)
+[![VS Code](https://img.shields.io/badge/VS%20Code-1.109.0+-blue.svg)](https://code.visualstudio.com/)
+[![Version](https://img.shields.io/badge/version-2.0.3-green.svg)](https://github.com/Open-CMSIS-Pack/CMSIS-DebugMCP/releases)
 
 <p align="center">
   <img src="assets/DebugMCP.webp" alt="CMSIS-DebugMCP Demo" width="800">
@@ -134,7 +134,7 @@ These are engineering invariants the agent can rely on — see [CHANGES-VS-UPSTR
 
 ### From the GitHub release (recommended)
 
-Download the latest `cmsis-debugmcp-<version>.vsix` from <https://github.com/MatthiasHertel80/CMSIS-DebugMCP/releases>, then:
+Download the latest `cmsis-debugmcp-<version>.vsix` from <https://github.com/Open-CMSIS-Pack/CMSIS-DebugMCP/releases>, then:
 
 ```bash
 code --install-extension cmsis-debugmcp-<version>.vsix
@@ -145,15 +145,15 @@ Reload the VS Code window after install. Copilot picks the server up automatical
 ### From source
 
 ```bash
-git clone https://github.com/MatthiasHertel80/CMSIS-DebugMCP.git
+git clone https://github.com/Open-CMSIS-Pack/CMSIS-DebugMCP.git
 cd CMSIS-DebugMCP
 npm install
-npx --yes @vscode/vsce package --allow-star-activation
-code --install-extension cmsis-debugmcp-<version>.vsix --force
+npm run package
+code --install-extension cmsis-debugmcp-<target>-<version>.vsix --force
 ```
 
-`vsce package` runs `vscode:prepublish`, which type-checks and builds the
-esbuild bundle — you do not need a separate `npm run compile` first.
+`npm run package` type-checks the project, builds the production esbuild
+bundle, and creates a platform-targeted VSIX with the local `vsce` tooling.
 
 The extension activates on startup. One VS Code window binds `http://localhost:3001/mcp` and routes tool calls to whichever window owns the target; the others run a loopback control server and register themselves. Copilot picks the endpoint up automatically via the `McpServerDefinitionProvider`. See [Networking and multiple windows](#networking-and-multiple-windows).
 
@@ -424,6 +424,8 @@ The extension handles debug configurations intelligently:
 
 ## Requirements
 
+- **Node.js** `22.22.x` and **npm** `10.x` for development and packaging
+- **VS Code** `1.109.0` or newer
 - VSCode with appropriate language extensions installed:
   - **Python**: [Python extension](vscode:extension/ms-python.debugpy) for `.py` files
   - **JavaScript/TypeScript**: Built-in Node.js debugger or [JavaScript Debugger extension](vscode:extension/ms-vscode.js-debug)
@@ -441,10 +443,11 @@ The extension handles debug configurations intelligently:
 ```bash
 npm install
 
-npm run compile        # tsc → out/  (what the tests run against)
+npm run compile        # tsc → out/src  (what the tests run against)
 npm run check-types    # type-check only
-npm run package        # check-types + production esbuild bundle → dist/
-npm run lint           # one pre-existing eqeqeq warning in serialMonitorBridge.ts is expected
+npm run build          # check-types + production esbuild bundle → dist/
+npm run package        # build + create a platform-targeted VSIX
+npm run lint           # lint src/
 ```
 
 The extension ships as the esbuild bundle in `dist/`; `out/` exists for the
@@ -464,7 +467,7 @@ the Electron harness will not start:
 
 ```bash
 ./node_modules/.bin/mocha --ui tdd \
-  --require test/transport/vscode-stub.js out/test/*.test.js
+  --require test/transport/vscode-stub.js out/src/test/*.test.js
 ```
 
 `test/transport/packaged-vsix.js` is the one that catches packaging mistakes:
@@ -484,4 +487,4 @@ See [SECURITY.md](SECURITY.md) for reporting guidance. Do not report security vu
 
 MIT License — see [LICENSE.txt](LICENSE.txt) for details.
 
-Based on **DebugMCP**, originally created by **Oz Zafar**, **Ori Bar-Ilan** and **Karin Brisker** (Microsoft). CMSIS/Cortex-M embedded extensions maintained by Matthias Hertel (Arm).
+Based on **DebugMCP**, originally created by **Oz Zafar**, **Ori Bar-Ilan** and **Karin Brisker** (Microsoft). CMSIS/Cortex-M embedded extensions maintained by Arm.

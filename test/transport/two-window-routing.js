@@ -21,7 +21,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 
-const OUT = path.resolve(__dirname, '..', '..', 'out');
+const OUT = path.resolve(__dirname, '..', '..', 'out', 'src');
 
 let failures = 0;
 function check(name, ok, detail) {

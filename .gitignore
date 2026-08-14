@@ -421,9 +421,9 @@ test/realboard/realboard.report.*.json
 *.msm
 *.msp
 
-
 node_modules/*
 out/*
 .vscode-test/*
+.cmsis-dev/*
 # macOS Finder metadata
 .DS_Store

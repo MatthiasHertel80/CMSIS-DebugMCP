@@ -185,6 +185,7 @@ class SerialMonitorBridge {
     }
 
     private coerceToBuffer(evt: any): Buffer | null {
+        // eslint-disable-next-line eqeqeq -- intentionally match null and undefined.
         if (evt == null) { return null; }
         if (Buffer.isBuffer(evt)) { return evt; }
         if (evt instanceof Uint8Array) { return Buffer.from(evt); }
