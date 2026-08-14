@@ -1,5 +1,5 @@
 name: Bug Report
-description: File a bug/issue
+description: Report a bug or issue.
 title: "<title>"
 type: "Bug"
 projects:
@@ -9,15 +9,8 @@ body:
   - type: textarea
     id: description
     attributes:
-      label: "Current behavior, Steps to reproduce and Expected behavior"
-      description: "Provide details about the bug."
-      placeholder: "Explain the unexpected behavior, steps to reproduce and expected behavior..."
+      label: Details
+      description: Describe the problem and include any useful context.
+      placeholder: Explain what happened, what you expected, and how to reproduce it.
     validations:
       required: true
-
-  - type: textarea
-    id: additional_info
-    attributes:
-      label: "Additional Information"
-      description: "Any extra context or screenshots?"
-      placeholder: "Paste logs, screenshots, or links here."
