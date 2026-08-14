@@ -12,7 +12,7 @@ require('./vscode-stub.js');
 
 const http = require('http');
 const path = require('path');
-const OUT = path.resolve(__dirname, '..', '..', 'out');
+const OUT = path.resolve(__dirname, '..', '..', 'out', 'src');
 
 const { DebugMCPServer } = require(path.join(OUT, 'debugMCPServer.js'));
 

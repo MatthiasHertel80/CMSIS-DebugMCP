@@ -443,7 +443,7 @@ The extension handles debug configurations intelligently:
 ```bash
 npm install
 
-npm run compile        # tsc → out/  (what the tests run against)
+npm run compile        # tsc → out/src  (what the tests run against)
 npm run check-types    # type-check only
 npm run build          # check-types + production esbuild bundle → dist/
 npm run package        # build + create a platform-targeted VSIX
@@ -467,7 +467,7 @@ the Electron harness will not start:
 
 ```bash
 ./node_modules/.bin/mocha --ui tdd \
-  --require test/transport/vscode-stub.js out/test/*.test.js
+  --require test/transport/vscode-stub.js out/src/test/*.test.js
 ```
 
 `test/transport/packaged-vsix.js` is the one that catches packaging mistakes:

@@ -13,7 +13,7 @@ import * as path from 'path';
  */
 suite('Bundled agent skill', () => {
 
-    const repoRoot = path.resolve(__dirname, '..', '..');
+    const repoRoot = path.resolve(__dirname, '..', '..', '..');
     const skillDir = path.join(repoRoot, 'skills', 'cmsis-debug-live');
     const skillMd = path.join(skillDir, 'SKILL.md');
 
